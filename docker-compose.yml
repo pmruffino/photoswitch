@@ -88,7 +88,7 @@ services:
       - default
       - proxy
     ports:
-      - "${WEB_PORT:-2273}:80"
+      - "${WEB_PORT:-2273}:2273"
     depends_on:
       - backend
 

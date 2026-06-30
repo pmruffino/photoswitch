@@ -69,8 +69,15 @@ React SPA ──► FastAPI (control plane, 1 instance)
 
 - **FastAPI** backend (`backend/`) — async, single instance. Handles auth, job
   creation, state reads/writes, and job enqueueing. Does no heavy lifting.
+  Built on Chainguard's hardened `cgr.dev/chainguard/python` images (two-stage:
+  `-dev` variant to pip-install, distroless runtime variant to serve).
 - **React + TypeScript SPA** (`frontend/`) — Tailwind CSS, full admin + user UI.
-  Served by nginx which also reverse-proxies `/api/` to the backend.
+  Served by nginx which also reverse-proxies `/api/` to the backend. Built on
+  Chainguard's `cgr.dev/chainguard/node` (build stage) and `cgr.dev/chainguard/nginx`
+  (runtime) images. Chainguard's nginx runs as a non-root user, which can't bind
+  privileged ports, so nginx listens on `2273` internally (not 80) — both
+  `frontend/nginx.conf` and the `frontend` service's `ports:` mapping in
+  `docker-compose.yml` map `${WEB_PORT:-2273}:2273`.
 
 ### Workers
 

@@ -1,15 +1,22 @@
-FROM python:3.12-slim
+FROM cgr.dev/chainguard/python:latest-dev AS build
 
 WORKDIR /app
 
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --target=/app/packages -r requirements.txt
+
+FROM cgr.dev/chainguard/python:latest
+
+WORKDIR /app
+
+COPY --from=build /app/packages /app/packages
 
 # schemas.py is shared; copy from project root
 COPY schemas.py .
 COPY backend/ .
 
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/packages
 
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
