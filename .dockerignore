@@ -1,0 +1,33 @@
+# Version control
+.git/
+
+# Environment — never include secrets in the build context
+.env
+docker-compose.override.yml
+
+# Node build artifacts (not needed in backend/worker images)
+frontend/node_modules/
+frontend/dist/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local dev copies of schemas.py (created by `cp ../schemas.py .`)
+backend/schemas.py
+workers/schemas.py
+
+# Local volume data
+data/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

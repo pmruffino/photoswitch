@@ -1,0 +1,13 @@
+# Enforce LF line endings in the repository for all text files.
+# This prevents CRLF from being committed from Windows checkouts,
+# which would cause issues in Linux Docker images.
+* text=auto eol=lf
+
+# Binary files — no line ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.gif binary
+*.woff binary
+*.woff2 binary

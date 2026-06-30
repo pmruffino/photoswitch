@@ -1,0 +1,143 @@
+networks:
+  default:
+    name: photoswitch
+  proxy:
+    external: true
+    name: proxy
+
+x-worker-base: &worker-base
+  image: ghcr.io/pmruffino/photoswitch-worker:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  labels:
+    net.unraid.docker.icon: "https://github.com/pmruffino/photoswitch/raw/main/photoswitch_icon.png"
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - default
+    - proxy
+  volumes:
+    - ${STAGING_PATH}:/staging
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: photoswitch_postgres
+    restart: unless-stopped
+    labels:
+      net.unraid.docker.icon: "https://github.com/pmruffino/photoswitch/raw/main/photoswitch_icon.png"
+    environment:
+      POSTGRES_DB: photoswitch
+      POSTGRES_USER: ${POSTGRES_USER:-psw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /mnt/cache/appdata/photoswitch/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-psw} -d photoswitch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: photoswitch_redis
+    restart: unless-stopped
+    labels:
+      net.unraid.docker.icon: "https://github.com/pmruffino/photoswitch/raw/main/photoswitch_icon.png"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - /mnt/cache/appdata/photoswitch/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/pmruffino/photoswitch-backend:${IMAGE_TAG:-latest}
+    container_name: photoswitch_backend
+    restart: unless-stopped
+    labels:
+      net.unraid.docker.icon: "https://github.com/pmruffino/photoswitch/raw/main/photoswitch_icon.png"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      REDIS_URL: redis://redis:6379/0
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-86400}
+      STAGING_ROOT: /staging
+    networks:
+      - default
+      - proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ${STAGING_PATH}:/staging
+
+  frontend:
+    image: ghcr.io/pmruffino/photoswitch-frontend:${IMAGE_TAG:-latest}
+    container_name: photoswitch_frontend
+    restart: unless-stopped
+    labels:
+      net.unraid.docker.icon: "https://github.com/pmruffino/photoswitch/raw/main/photoswitch_icon.png"
+    networks:
+      - default
+      - proxy
+    ports:
+      - "${WEB_PORT:-2273}:80"
+    depends_on:
+      - backend
+
+  worker-fetcher:
+    <<: *worker-base
+    container_name: photoswitch_worker_fetcher
+    environment:
+      WORKER_TYPE: fetcher
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      STAGING_ROOT: /staging
+
+  worker-unpacker:
+    <<: *worker-base
+    container_name: photoswitch_worker_unpacker
+    environment:
+      WORKER_TYPE: unpacker
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      STAGING_ROOT: /staging
+
+  worker-mapper:
+    <<: *worker-base
+    container_name: photoswitch_worker_mapper
+    environment:
+      WORKER_TYPE: mapper
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      STAGING_ROOT: /staging
+
+  worker-loader:
+    <<: *worker-base
+    container_name: photoswitch_worker_loader
+    environment:
+      WORKER_TYPE: loader
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      STAGING_ROOT: /staging
+
+  worker-rollback:
+    <<: *worker-base
+    container_name: photoswitch_worker_rollback
+    environment:
+      WORKER_TYPE: rollback
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-psw}:${POSTGRES_PASSWORD}@postgres:5432/photoswitch
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      STAGING_ROOT: /staging

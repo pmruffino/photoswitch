@@ -1,0 +1,32 @@
+# Environment
+.env
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+backend/schemas.py
+workers/schemas.py
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env*
+
+# Local volume data (non-Unraid alternative paths documented in README)
+data/
+
+# Docker
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local session state
+.claude/settings.local.json
