@@ -23,14 +23,14 @@ from schemas import (
     Stage,
     CLEANUP_HOUR_KEY,
     DEFAULT_CLEANUP_HOUR,
-    DEFAULT_SEMAPHORE_LIMITS,
     DEFAULT_MAX_TAKEOUT_BYTES,
     DEFAULT_STAGING_RETENTION_DAYS,
+    DEFAULT_WORKER_PCT,
     MAX_TAKEOUT_BYTES_KEY,
     STAGING_RETENTION_DAYS_KEY,
     job_key,
-    semaphore_limit_key,
     user_jobs_key,
+    worker_pct_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,8 +150,8 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
     redis = await init_redis()
-    for stage, limit in DEFAULT_SEMAPHORE_LIMITS.items():
-        await redis.set(semaphore_limit_key(stage), limit, nx=True)
+    for stage in Stage:
+        await redis.set(worker_pct_key(stage), DEFAULT_WORKER_PCT, nx=True)
     await redis.set(SIGNUP_POLICY_KEY, "open", nx=True)
     await redis.set(MAX_TAKEOUT_BYTES_KEY, DEFAULT_MAX_TAKEOUT_BYTES, nx=True)
     await redis.set(STAGING_RETENTION_DAYS_KEY, DEFAULT_STAGING_RETENTION_DAYS, nx=True)
