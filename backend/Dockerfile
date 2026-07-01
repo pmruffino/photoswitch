@@ -29,4 +29,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/packages
 
 EXPOSE 8000
+# The Chainguard python base sets ENTRYPOINT ["python"]; reset it so the CMD
+# below runs as-is instead of being appended (which yields `python python ...`).
+ENTRYPOINT []
 CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
