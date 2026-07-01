@@ -1,11 +1,21 @@
 FROM cgr.dev/chainguard/python:latest-dev AS build
 
+# Chainguard's python image defaults to a non-root user; WORKDIR /app is created
+# owned by root, so pip can't write into /app/packages. Run the throwaway build
+# stage as root. The distroless runtime stage below stays non-root.
+USER root
+
 WORKDIR /app
 
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --target=/app/packages -r requirements.txt
 
 FROM cgr.dev/chainguard/python:latest
+
+# The backend writes to and cleans up the shared /staging bind mount that the
+# root-running Alpine workers also write to. Run as root so it can create and
+# rmtree those mixed-ownership dirs without EACCES.
+USER root
 
 WORKDIR /app
 
