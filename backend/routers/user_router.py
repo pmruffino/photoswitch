@@ -120,7 +120,12 @@ async def delete_account(
     token = request.cookies.get("session")
     if token:
         await delete_session(redis, token)
-    response.delete_cookie("session", httponly=True, samesite="lax")
+    response.delete_cookie(
+        "session",
+        httponly=True,
+        samesite="lax",
+        secure=os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes"),
+    )
 
     # Clean up all job data (Redis keys + staging dirs) before removing the user
     job_result = await db.execute(select(JobRecord).where(JobRecord.user_id == user.id))

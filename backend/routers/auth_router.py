@@ -15,6 +15,10 @@ router = APIRouter()
 SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", 86400))
 SIGNUP_POLICY_KEY = "psw:config:signup_policy"
 
+# Set COOKIE_SECURE=true when serving over HTTPS so the session cookie is only
+# ever sent over TLS. Defaults off so plain-HTTP LAN deployments keep working.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+
 
 class RegisterRequest(BaseModel):
     username: str
@@ -114,6 +118,7 @@ async def login(
         value=token,
         httponly=True,
         samesite="lax",
+        secure=COOKIE_SECURE,
         max_age=ttl,
     )
 
@@ -129,7 +134,7 @@ async def logout(
     token = request.cookies.get("session")
     if token:
         await delete_session(redis, token)
-    response.delete_cookie("session", httponly=True, samesite="lax")
+    response.delete_cookie("session", httponly=True, samesite="lax", secure=COOKIE_SECURE)
 
 
 @router.get("/me")

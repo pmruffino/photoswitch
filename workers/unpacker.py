@@ -74,7 +74,11 @@ class UnpackerWorker(BaseWorker):
             job.total_items = len(members)
             job.processed_items = 0
             for i, member in enumerate(members):
-                tf.extract(member, dest, set_attrs=False)
+                # filter="data" (Python 3.12+) blocks path traversal, absolute
+                # paths, and symlink/device escapes from a malicious archive
+                # (CVE-2007-4559). Takeout archives are user-supplied, so the
+                # extracted tree must stay confined to `dest`.
+                tf.extract(member, dest, set_attrs=False, filter="data")
                 job.processed_items = i + 1
 
     def _count_media(self, directory: str) -> int:
