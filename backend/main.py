@@ -170,23 +170,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Photoswitch", version="0.1.0", lifespan=lifespan)
 
-# The SPA is served same-origin (nginx proxies /api to the backend), so no CORS
-# is needed by default. A wildcard origin combined with credentials is both a
-# security risk and rejected by browsers, so cross-origin access is opt-in:
-# set CORS_ALLOW_ORIGINS to a comma-separated list of exact origins to enable it.
-_cors_origins = [
-    o.strip()
-    for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",")
-    if o.strip()
-]
-if _cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
