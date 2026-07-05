@@ -26,7 +26,12 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 class Stage(str, Enum):
-    """The worker types, in pipeline order. Each has its own queue + semaphore."""
+    """The worker types. Each has its own queue + semaphore.
+
+    The order a job visits stages depends on its Source (see PIPELINES) — e.g. an
+    iCloud *direct* pull has no archive, so it skips UNPACK. Use `next_stage()` /
+    `Job.advance()` rather than assuming a single global order.
+    """
     FETCH = "fetch"
     UNPACK = "unpack"
     MAP = "map"
@@ -35,12 +40,35 @@ class Stage(str, Enum):
 
     @property
     def next(self) -> Optional["Stage"]:
-        order = [Stage.FETCH, Stage.UNPACK, Stage.MAP, Stage.LOAD]
-        try:
-            i = order.index(self)
-        except ValueError:
-            return None  # stages outside the main pipeline (e.g. ROLLBACK) have no next
-        return order[i + 1] if i + 1 < len(order) else None
+        # Back-compat shim: the default (Google/bundle) pipeline order. Source-aware
+        # code should call next_stage(stage, source) instead.
+        return next_stage(self, Source.GOOGLE_TAKEOUT)
+
+
+class Source(str, Enum):
+    """Where a job's media originates. Drives the stage pipeline it flows through."""
+    GOOGLE_TAKEOUT = "google_takeout"   # Takeout archive (link or upload) → unpack → map → load
+    ICLOUD_BUNDLE = "icloud_bundle"     # Apple Data & Privacy export archive (upload) → unpack → map → load
+    ICLOUD_DIRECT = "icloud_direct"     # Live iCloud pull via API → (no unpack) → map → load
+
+
+# Per-source stage pipelines. The Fetcher for ICLOUD_DIRECT writes media straight
+# into the extracted dir, so there is nothing to UNPACK — that stage is skipped.
+PIPELINES: dict["Source", list[Stage]] = {
+    Source.GOOGLE_TAKEOUT: [Stage.FETCH, Stage.UNPACK, Stage.MAP, Stage.LOAD],
+    Source.ICLOUD_BUNDLE: [Stage.FETCH, Stage.UNPACK, Stage.MAP, Stage.LOAD],
+    Source.ICLOUD_DIRECT: [Stage.FETCH, Stage.MAP, Stage.LOAD],
+}
+
+
+def next_stage(stage: Stage, source: "Source") -> Optional[Stage]:
+    """Next stage for `source`'s pipeline, or None if `stage` is terminal/off-pipeline."""
+    pipeline = PIPELINES.get(source, PIPELINES[Source.GOOGLE_TAKEOUT])
+    try:
+        i = pipeline.index(stage)
+    except ValueError:
+        return None  # stages outside the pipeline (e.g. ROLLBACK) have no next
+    return pipeline[i + 1] if i + 1 < len(pipeline) else None
 
 
 class JobStatus(str, Enum):
@@ -136,6 +164,28 @@ CLEANUP_HOUR_KEY = f"{REDIS_NS}:config:cleanup_hour"
 DEFAULT_CLEANUP_HOUR = 3  # 3 AM UTC
 
 
+# --- Periodic iCloud sync ---------------------------------------------------
+# The recurrence is driven by a scheduler loop in the backend control plane (next
+# to the cleanup loop). It enqueues a normal ICLOUD_DIRECT job on the FETCH queue
+# whenever an iCloud connection's sync is enabled and due. There is NO dedicated
+# sync worker — the Fetcher does the incremental pull, the Loader still uploads.
+
+# How often the scheduler wakes to look for due syncs (seconds). Must be <= the
+# smallest allowed interval (15 min) so a 15-min sync fires close to on time.
+SYNC_SCHEDULER_TICK_SECONDS = 120
+# Floor on a user-configured sync interval, to protect Apple's servers and ours.
+SYNC_MIN_INTERVAL_MINUTES = 15
+DEFAULT_SYNC_INTERVAL_MINUTES = 1440  # daily
+
+# Allowed sync-frequency presets (minutes) surfaced in the UI.
+SYNC_INTERVAL_PRESETS = [15, 60, 120, 240, 480, 720, 1440, 2880, 4320, 10080]
+
+
+def sync_lock_key(connection_id: str) -> str:
+    """Short-lived lock so the scheduler never enqueues two runs for one connection."""
+    return f"{REDIS_NS}:sync:lock:{connection_id}"
+
+
 # ---------------------------------------------------------------------------
 # Job payloads
 # ---------------------------------------------------------------------------
@@ -148,13 +198,33 @@ def _new_id() -> str:
     return uuid4().hex
 
 
-class ImmichTarget(BaseModel):
-    """Where a job uploads to. The api_key is decrypted just-in-time by the Loader;
-    it is NEVER stored in Redis in plaintext — only an opaque reference is enqueued."""
-    server_url: str = Field(..., description="Base URL of the user's Immich server")
-    credential_ref: str = Field(
-        ..., description="Opaque id of the encrypted Immich API key row in Postgres"
+class DestinationKind(str, Enum):
+    """Which kind of server a job uploads to; selects the Loader/Rollback path."""
+    IMMICH = "immich"
+    WEBDAV = "webdav"   # Nextcloud, ownCloud, PhotoPrism, or any WebDAV server
+
+
+class Destination(BaseModel):
+    """Where a job uploads to. Secrets are decrypted just-in-time by the Loader from
+    the row referenced by `credential_ref`; only the opaque reference is enqueued —
+    never a plaintext secret in Redis.
+
+    `kind` selects both the Loader path and which Postgres table `credential_ref`
+    points at (`immich_credentials` for immich, `webdav_destinations` for webdav).
+    """
+    kind: DestinationKind = Field(
+        default=DestinationKind.IMMICH,
+        description="Destination type; also picks the credentials table for credential_ref",
     )
+    server_url: str = Field(..., description="Base URL of the destination server")
+    credential_ref: str = Field(
+        ..., description="Opaque id of the encrypted credentials row in Postgres"
+    )
+
+
+# Back-compat alias: earlier code and serialized jobs used the name ImmichTarget.
+# Fields are unchanged (kind defaults to immich), so existing Redis payloads validate.
+ImmichTarget = Destination
 
 
 class DateFilter(BaseModel):
@@ -203,11 +273,17 @@ class Job(BaseModel):
     id: str = Field(default_factory=_new_id)
     user_id: str
 
+    source: Source = Field(
+        default=Source.GOOGLE_TAKEOUT,
+        description="Origin of the media; selects the stage pipeline (see PIPELINES)",
+    )
     stage: Stage = Stage.FETCH
     status: JobStatus = JobStatus.QUEUED
 
     # --- inputs ---
-    takeout_url: str = Field(..., description="User-provided public link to Takeout")
+    # For Google jobs this is the public Takeout link; for uploads / iCloud it holds
+    # a scheme-tagged synthetic value (upload://, icloud://, rollback://).
+    takeout_url: str = Field(..., description="Source locator for the job")
     target: ImmichTarget
     auto_ingest: bool = Field(
         default=True,
@@ -216,6 +292,16 @@ class Job(BaseModel):
     date_filter: Optional[DateFilter] = Field(
         default=None,
         description="If set, only assets whose taken_at falls within this range are uploaded/removed",
+    )
+
+    # --- iCloud-specific ---
+    icloud_connection_ref: Optional[str] = Field(
+        default=None,
+        description="For ICLOUD_DIRECT jobs: id of the encrypted iCloud connection row in Postgres",
+    )
+    is_sync_anchor: Optional[bool] = Field(
+        default=False,
+        description="True for the initial import that anchors a recurring sync; exempt from staging cleanup",
     )
 
     # --- rollback-specific ---
@@ -252,8 +338,11 @@ class Job(BaseModel):
         self.updated_at = _now()
 
     def advance(self) -> bool:
-        """Move to the next stage. Returns False if this was the final stage."""
-        nxt = self.stage.next
+        """Move to the next stage in this job's source pipeline.
+
+        Returns False if this was the final stage (job is then marked succeeded).
+        """
+        nxt = next_stage(self.stage, self.source)
         if nxt is None:
             self.status = JobStatus.SUCCEEDED
             self.touch()

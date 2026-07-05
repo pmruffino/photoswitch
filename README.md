@@ -1,18 +1,29 @@
 # Photoswitch
 
-Middleware that ingests photos and metadata from a Google Takeout export into one or more [Immich](https://immich.app) servers. Runs as a self-contained Docker Compose stack using prebuilt images from GHCR.
+Middleware that migrates photos **and their metadata** from **Google Photos** or **Apple iCloud** into one or more [Immich](https://immich.app) servers or **WebDAV** destinations (Nextcloud, ownCloud, PhotoPrism). Runs as a self-contained Docker Compose stack using prebuilt images from GHCR.
+
+## Sources and destinations
+
+**Sources** (where photos come from):
+- **Google Photos** via [Google Takeout](https://takeout.google.com) — paste a public Drive share link or upload the archive directly.
+- **Apple iCloud — direct connection** — sign in with your Apple ID + a one-time 2FA code; the trusted session is stored encrypted and reused, with support for incremental pulls and scheduled **periodic sync**.
+- **Apple iCloud — export bundle** — upload an archive from [privacy.apple.com](https://privacy.apple.com) → *Get a copy of your data*.
+
+**Destinations** (where photos go):
+- **Immich** — uploads via the Immich API, dedupes by checksum, creates/joins albums.
+- **WebDAV** — one integration covering **Nextcloud, ownCloud, and PhotoPrism** (or any WebDAV server). Photos upload into folders; metadata written into each file's EXIF is indexed automatically by Nextcloud Memories / PhotoPrism. Albums are folder-based, and a photo in several albums is uploaded once (extra album membership uses a server-side copy, not a re-upload).
 
 ## How it works
 
-A user provides their Google Takeout archive — either as a public share link or by uploading the file directly — and selects which Immich server to upload to. The app processes the archive through a five-stage pipeline:
+A user connects a source and a destination, then runs a job that flows through a pipeline of independent worker pools communicating over Redis queues:
 
-1. **Fetch** — Downloads the Takeout archive from the public link (or receives a direct upload)
-2. **Unpack** — Extracts the `.zip` or `.tgz` archive
-3. **Map** — Pairs each media file with its Google JSON sidecar, writes correct EXIF/QuickTime timestamps, GPS coordinates, and descriptions using `exiftool`, and detects Live Photos. Album membership is derived from the Takeout folder structure: Google exports album copies into named subdirectories alongside year-rollup folders (`Photos from YYYY`). Any folder that isn't a year-rollup folder is treated as an album name.
-4. **Load** — Uploads assets to Immich via its REST API, deduplicates by checksum, and creates albums. Supports an optional date range filter to selectively upload assets by date.
-5. **Rollback** — Removes previously uploaded assets from Immich. Verifies ownership before deleting so pre-existing duplicates in Immich are never affected.
+1. **Fetch** — Downloads a Takeout archive from a public link, receives a direct upload, or (for iCloud direct) pulls new photos over the iCloud API into staging.
+2. **Unpack** — Extracts the `.zip`/`.tgz` archive. (Skipped for an iCloud direct pull, which has no archive.)
+3. **Map** — Writes correct EXIF/QuickTime timestamps, GPS, and descriptions using `exiftool`, detects Live Photos, and records album membership. Google metadata comes from JSON sidecars (album names from the Takeout folder structure — any folder that isn't a `Photos from YYYY` year-rollup is treated as an album); iCloud direct metadata comes from a manifest the Fetcher writes; export bundles rely on embedded EXIF.
+4. **Load** — Uploads assets to the job's destination. For **Immich**, via its REST API with checksum dedup and album creation; for **WebDAV**, by uploading files into folders. Supports an optional date-range filter.
+5. **Rollback** — Removes a job's previously uploaded assets from the destination. For Immich it verifies ownership so pre-existing duplicates are never affected; for WebDAV it deletes the uploaded files by path.
 
-Each stage runs as an independent pool of worker containers communicating through Redis queues. The control plane (FastAPI + React) manages users, credentials, and job dispatch. Progress updates automatically in the Dashboard while jobs are running.
+Which stages a job visits depends on its source, and the Loader/Rollback dispatch on the destination type. Recurrence for periodic iCloud sync is driven by a scheduler in the backend — there is no separate sync worker. The control plane (FastAPI + React) manages users, credentials, connections, and job dispatch; progress updates live in the Dashboard.
 
 ## Stack
 
@@ -67,23 +78,21 @@ The web UI will be available at `http://<host>:<WEB_PORT>` (default port 2273).
 
 The first account registered automatically becomes the admin. All subsequent registrations are governed by the **New User Policy** set in the Admin panel (`open` / `approval` / `closed`).
 
-### 4. Connect Immich
+### 4. Add a destination
 
-In the Dashboard, add an Immich connection:
-- **Server URL** — e.g. `https://immich.example.com`
-- **API Key** — generate one in Immich under *Account Settings → API Keys*
+In the Dashboard, add at least one destination and use **Test** to verify it:
 
-Use **Test** to verify the connection before starting a job.
+- **Immich** — Server URL (e.g. `https://immich.example.com`) + an API key generated in Immich under *Account Settings → API Keys*.
+- **WebDAV** (Nextcloud / ownCloud / PhotoPrism) — WebDAV URL (Nextcloud/ownCloud: `…/remote.php/dav/files/<user>`), username, and password (prefer an app-password), plus an upload folder.
 
 ### 5. Run an import
 
-Click **Add bundle**, then either:
-- Paste a Google Takeout public download link, or
-- Upload the archive file directly
+- **Google Takeout** — click **Add bundle**, then paste a public download link or upload the archive. Pick a destination, optionally set a date range, and start.
+  > Google Takeout public links expire — unshare the link in Google Drive after the import finishes.
+- **Apple iCloud (direct)** — in the **Apple iCloud** section, click **Connect iCloud**, enter the 2FA code Apple sends to your device, then **Import now**. To sync on a schedule, mark the import as a *sync anchor* and open **Configure sync** (15 min up to 1 week); **Sync now** runs it on demand.
+- **Apple export bundle** — upload the archive from privacy.apple.com in the Apple iCloud section.
 
-Select your Immich connection, optionally set a date range filter, and start. Progress updates live in the Dashboard.
-
-> **Note:** Google Takeout public links expire. Unshare the link in Google Drive after the import finishes.
+Progress updates live in the **Imports** table, where you can also resume, adjust-and-rerun, or roll back a job.
 
 ---
 
@@ -94,7 +103,7 @@ Copy `.env.example` to `.env` and fill in all values. **All required variables m
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `POSTGRES_PASSWORD` | **Yes** | — | Password for the PostgreSQL user. Use a strong random string. |
-| `APP_SECRET_KEY` | **Yes** | — | 32-byte hex key used to encrypt Immich API keys at rest. Generate with: `python3 -c "import secrets; print(secrets.token_hex(32))"` |
+| `APP_SECRET_KEY` | **Yes** | — | 32-byte hex key used to encrypt secrets at rest (Immich API keys, WebDAV passwords, and the iCloud password + trusted session). Generate with: `python3 -c "import secrets; print(secrets.token_hex(32))"` |
 | `STAGING_PATH` | **Yes** | — | Absolute host path for the shared staging volume (downloads, extracts, mapped files). All worker and backend containers mount this same path. On Unraid, use an NVMe cache path, e.g. `/mnt/cache/appdata/photoswitch/staging`. |
 | `POSTGRES_USER` | No | `psw` | PostgreSQL username. |
 | `WEB_PORT` | No | `2273` | Host port the web UI is exposed on. |
@@ -108,11 +117,11 @@ Copy `.env.example` to `.env` and fill in all values. **All required variables m
 The backend, frontend, and all workers are connected to **two** Docker networks:
 
 - **`photoswitch`** (default, internal) — used for all intra-stack communication (backend ↔ postgres, backend ↔ redis, workers ↔ redis, frontend ↔ backend).
-- **`proxy`** (external) — allows the backend and workers to make outbound HTTPS calls to Immich servers that are behind the reverse proxy on the same Docker host.
+- **`proxy`** (external) — allows the backend and workers to make outbound HTTPS calls to Immich or WebDAV destinations that are behind the reverse proxy on the same Docker host.
 
 Postgres and Redis are on the internal network only and are not exposed to the proxy network.
 
-If your Immich server is behind a reverse proxy on the same host, you may also need an `extra_hosts` entry in a `docker-compose.override.yml` to resolve the domain name to the proxy container's IP:
+If your destination server is behind a reverse proxy on the same host, you may also need an `extra_hosts` entry in a `docker-compose.override.yml` to resolve the domain name to the proxy container's IP:
 
 ```yaml
 # docker-compose.override.yml  (do not commit — host-specific)
@@ -167,6 +176,14 @@ Each pipeline stage has a Redis semaphore controlling how many jobs run simultan
 
 ## Features
 
+### Apple iCloud sync
+
+Connect an Apple ID (with a one-time 2FA code) and import your iCloud library directly — no manual export needed. The trusted session is stored encrypted and reused until Apple expires it. An import can be designated the **anchor** for a recurring sync, scheduled at a fixed frequency (15 min · 1/2/4/8/12 h · 1/2/3 day · 1 week); each run pulls only photos added since the last one. **Sync now** triggers a run on demand. Deleting the anchor job cleanly stops the schedule without touching your connection or already-uploaded photos.
+
+### WebDAV destinations
+
+Upload to Nextcloud, ownCloud, or PhotoPrism (or any WebDAV server) instead of — or alongside — Immich. Metadata is carried in each file's EXIF, so it's indexed automatically. Albums map to folders; a photo in multiple albums is uploaded once and copied server-side into the other album folders.
+
 ### Date range filtering
 
 When starting a job or re-running the load stage, you can specify an optional date range. Only assets whose timestamp falls within the range are uploaded. Optionally include or exclude assets that have no date metadata at all. Jobs with a date filter are excluded from automatic staging cleanup so you can re-run with a different filter without re-downloading.
@@ -177,7 +194,7 @@ A completed load job with a date filter can be re-queued directly to the load st
 
 ### Rollback
 
-Any completed load job can be rolled back: the app identifies assets uploaded by that specific job (by device ID and checksum), verifies ownership, and permanently removes them from Immich. Pre-existing duplicates that were in Immich before the job ran are never touched. Rollback and re-run are independent operations — you can roll back, then re-run (with a different date range if desired), and back again.
+Any completed load job can be rolled back: the app identifies the assets that job uploaded and removes them from the destination. For **Immich** it matches by device ID + checksum and verifies ownership, so pre-existing duplicates are never touched; for **WebDAV** it deletes the uploaded files by path. Rollback and re-run are independent operations — you can roll back, then re-run (with a different date range if desired), and back again.
 
 ---
 
@@ -200,7 +217,7 @@ It runs on every push to `main` (tagging `latest`) and on `v*` tags (tagging the
 ```bash
 cd backend
 pip install -r requirements.txt
-cp ../schemas.py .
+cp ../schemas.py ../icloud_client.py .
 
 DATABASE_URL=postgresql+asyncpg://psw:password@localhost:5432/photoswitch \
 REDIS_URL=redis://localhost:6379/0 \
@@ -232,7 +249,7 @@ server: {
 ```bash
 cd workers
 pip install -r requirements.txt
-cp ../schemas.py .
+cp ../schemas.py ../icloud_client.py .
 
 WORKER_TYPE=mapper \
 REDIS_URL=redis://localhost:6379/0 \
@@ -250,31 +267,35 @@ Valid `WORKER_TYPE` values: `fetcher`, `unpacker`, `mapper`, `loader`, `rollback
 
 ```
 photoswitch/
-├── schemas.py               # Shared contracts (Job, Stage, Redis keys) — single source of truth
+├── schemas.py               # Shared contracts (Job, Source, Stage, Destination, Redis keys) — single source of truth
+├── icloud_client.py         # Shared iCloud client (pyicloud): 2FA/session, incremental pull, manifest
 ├── docker-compose.yml
 ├── .env.example
 ├── .github/workflows/
 │   └── docker-publish.yml   # Builds + pushes the three images to ghcr.io/pmruffino
 ├── backend/                 # FastAPI control plane
-│   ├── main.py              # App setup, startup tasks, scheduled cleanup
-│   ├── models.py            # SQLAlchemy ORM: User, ImmichCredential, JobRecord
+│   ├── main.py              # App setup, startup tasks, staging cleanup + iCloud sync scheduler
+│   ├── models.py            # ORM: User, ImmichCredential, WebDavDestination, ICloudConnection, JobRecord
 │   ├── auth.py              # Argon2 hashing, Redis session tokens
-│   ├── crypto.py            # Fernet encryption for Immich API keys
+│   ├── crypto.py            # Fernet encryption for secrets at rest
+│   ├── destinations.py      # Resolve (kind, id) → Immich/WebDAV destination
 │   ├── routers/
 │   │   ├── auth_router.py   # Login, logout, register, session
-│   │   ├── user_router.py   # Profile, Immich credentials (add/test/remove)
+│   │   ├── user_router.py   # Profile, Immich + WebDAV destinations (add/test/remove)
 │   │   ├── jobs_router.py   # Job create, list, resume, rerun, rollback, delete
+│   │   ├── icloud_router.py # iCloud connect/2FA, direct import, periodic-sync config, sync-now
 │   │   └── admin_router.py  # User management, concurrency limits, config
 │   └── Dockerfile
 ├── workers/                 # All five workers share one Docker image; WORKER_TYPE selects which runs
 │   ├── run_worker.py        # Entry point — reads WORKER_TYPE and starts the right class
 │   ├── base_worker.py       # Redis semaphore, BRPOP loop, retry logic, DB sync
-│   ├── fetcher.py           # Downloads Takeout archive from public link
+│   ├── fetcher.py           # Source-aware: Takeout download / upload / iCloud direct pull
 │   ├── unpacker.py          # Extracts archive to staging directory
-│   ├── loader.py            # Immich API upload, dedup, album creation, date filtering
-│   ├── rollback.py          # Ownership-verified asset removal from Immich
+│   ├── loader.py            # Destination-aware upload (Immich API / WebDAV), dedup, albums, date filtering
+│   ├── rollback.py          # Destination-aware asset removal (Immich ownership-verified / WebDAV by path)
+│   ├── webdav.py            # WebDAV client: folder albums, single-upload + server-side COPY, delete
 │   ├── mapper/
-│   │   ├── mapper.py        # Core: sidecar pairing, Live Photo detection, exiftool writes, SHA-1
+│   │   ├── mapper.py        # Core: sidecar/manifest pairing, Live Photo detection, exiftool writes, SHA-1
 │   │   ├── sidecar.py       # Google Photos JSON sidecar parser
 │   │   └── exiftool.py      # exiftool subprocess wrapper
 │   └── Dockerfile
@@ -283,7 +304,7 @@ photoswitch/
     │   ├── api.ts           # Typed API client
     │   ├── contexts/auth.tsx
     │   ├── pages/           # Login, Register, Dashboard, Admin, Profile
-    │   └── components/      # Layout (nav bar)
+    │   └── components/      # Layout, ICloudSection, WebDavSection
     ├── nginx.conf           # Serves SPA, proxies /api/ to backend with Docker DNS re-resolution
     └── Dockerfile
 ```

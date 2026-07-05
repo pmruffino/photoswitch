@@ -11,7 +11,8 @@ import asyncpg
 import httpx
 
 from base_worker import BaseWorker
-from schemas import DateFilter, Job, MappedAsset, Stage, job_key
+from schemas import DateFilter, DestinationKind, Job, MappedAsset, Stage, job_key
+from webdav import WebDavClient
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,42 @@ class RollbackWorker(BaseWorker):
         if not in_scope:
             return
 
+        if job.target.kind == DestinationKind.WEBDAV:
+            await self._rollback_webdav(job, in_scope)
+            return
+        await self._rollback_immich(job, in_scope, source_job_id)
+
+    async def _get_webdav_creds(self, credential_ref: str) -> tuple[str, str, str, str]:
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT base_url, username, encrypted_password, base_path "
+                "FROM webdav_destinations WHERE id = $1::uuid",
+                credential_ref,
+            )
+        if not row:
+            raise ValueError(f"WebDAV destination {credential_ref} not found")
+        password = _make_fernet().decrypt(bytes(row["encrypted_password"])).decode()
+        return row["base_url"], row["username"], password, row["base_path"]
+
+    async def _rollback_webdav(self, job: Job, in_scope: list[MappedAsset]) -> None:
+        base_url, username, password, base_path = await self._get_webdav_creds(job.target.credential_ref)
+        last_save = time.monotonic()
+        deleted = 0
+        async with WebDavClient(base_url, username, password, base_path) as client:
+            for asset in in_scope:
+                try:
+                    await client.delete_asset(asset)
+                    deleted += 1
+                except Exception as exc:
+                    logger.warning("WebDAV rollback delete failed for %s: %s", asset.file_path, exc)
+                job.processed_items += 1
+                now = time.monotonic()
+                if now - last_save >= 5.0:
+                    await self.save_job(job)
+                    last_save = now
+        logger.info("Job %s webdav rollback complete: removed %d assets", job.id, deleted)
+
+    async def _rollback_immich(self, job: Job, in_scope: list[MappedAsset], source_job_id: str) -> None:
         server_url, api_key = await self._get_api_key(job.target.credential_ref)
         base_url = server_url.rstrip("/")
         headers = {"x-api-key": api_key, "Accept": "application/json"}

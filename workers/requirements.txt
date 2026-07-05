@@ -3,3 +3,7 @@ pydantic>=2.0
 httpx>=0.27
 asyncpg>=0.30
 cryptography>=42.0
+# iCloud direct pull (Fetcher). Mainline pyicloud has the modern 2FA + cookie-dir
+# session API this codebase targets (icloud_client.py). All its deps install from
+# wheels on Alpine/musl (srp is pure-Python; cryptography/cffi ship musllinux wheels).
+pyicloud>=2.6

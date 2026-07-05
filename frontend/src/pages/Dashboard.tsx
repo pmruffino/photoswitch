@@ -1,6 +1,8 @@
 import { Fragment, FormEvent, useCallback, useEffect, useState } from 'react'
 import Layout from '../components/Layout'
-import { api, ImmichCred, Job, uploadJobChunked } from '../api'
+import ICloudSection from '../components/ICloudSection'
+import WebDavSection from '../components/WebDavSection'
+import { api, ImmichCred, WebDavDest, Job, toDestOptions, uploadJobChunked } from '../api'
 
 function stageProgress(job: Job): string {
   if (job.stage === 'fetch') return '—'
@@ -28,6 +30,20 @@ const STATUS_COLORS: Record<string, string> = {
   cancelled: 'bg-slate-100 text-slate-500 dark:bg-zinc-700 dark:text-zinc-400',
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  google_takeout: 'Google',
+  icloud_direct: 'iCloud',
+  icloud_bundle: 'iCloud bundle',
+}
+const SOURCE_COLORS: Record<string, string> = {
+  google_takeout: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+  icloud_direct:  'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400',
+  icloud_bundle:  'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400',
+}
+function destinationLabel(job: Job): string {
+  return job.destination_kind === 'webdav' ? 'WebDAV' : 'Immich'
+}
+
 const INPUT = 'w-full border border-slate-300 dark:border-zinc-600 rounded-md px-3 py-2 text-sm bg-white dark:bg-zinc-800 text-slate-900 dark:text-zinc-100 placeholder-slate-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-500'
 const BTN_PRIMARY = 'bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50'
 const BTN_SECONDARY = 'bg-white dark:bg-zinc-800 border border-slate-300 dark:border-zinc-600 text-slate-700 dark:text-zinc-300 px-4 py-2 rounded-md text-sm hover:bg-slate-50 dark:hover:bg-zinc-700'
@@ -42,6 +58,8 @@ function Badge({ text, color }: { text: string; color: string }) {
 
 export default function Dashboard() {
   const [creds, setCreds] = useState<ImmichCred[]>([])
+  const [webdavs, setWebdavs] = useState<WebDavDest[]>([])
+  const destOptions = toDestOptions(creds, webdavs)
   const [jobs, setJobs] = useState<Job[]>([])
   const [showAddCred, setShowAddCred] = useState(false)
   const [showNewJob, setShowNewJob] = useState(false)
@@ -67,9 +85,9 @@ export default function Dashboard() {
   const [testingCredId, setTestingCredId] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; detail?: string }>>({})
 
-  // New bundle form
+  // New bundle form. jobDest holds a combined "kind:id" destination key.
   const [jobUrl, setJobUrl] = useState('')
-  const [jobCredId, setJobCredId] = useState('')
+  const [jobDest, setJobDest] = useState('')
   const [jobAfterDate, setJobAfterDate] = useState('')
   const [jobBeforeDate, setJobBeforeDate] = useState('')
   const [jobAutoIngest, setJobAutoIngest] = useState(true)
@@ -105,11 +123,11 @@ export default function Dashboard() {
   }, [fetchJobs])
 
   useEffect(() => {
-    if (creds.length > 0 && !jobCredId) {
-      const saved = localStorage.getItem('psw:last-credential-id')
-      if (saved && creds.some(c => c.id === saved)) setJobCredId(saved)
+    if (destOptions.length > 0 && !jobDest) {
+      const saved = localStorage.getItem('psw:last-dest')
+      if (saved && destOptions.some(o => `${o.kind}:${o.id}` === saved)) setJobDest(saved)
     }
-  }, [creds, jobCredId])
+  }, [destOptions, jobDest])
 
   const hasActiveJobs = jobs.some(j => j.status === 'running' || j.status === 'queued')
   useEffect(() => {
@@ -195,6 +213,10 @@ export default function Dashboard() {
       setJobError('"After" date must be on or before "Before" date')
       return
     }
+    if (!jobDest) { setJobError('Please choose a destination'); return }
+    const sep = jobDest.indexOf(':')
+    const destKind = jobDest.slice(0, sep)
+    const destId = jobDest.slice(sep + 1)
     setJobLoading(true)
     try {
       let j: Job
@@ -204,7 +226,8 @@ export default function Dashboard() {
         j = await uploadJobChunked(
           jobFile,
           {
-            credential_id: jobCredId,
+            credential_id: destId,
+            destination_kind: destKind,
             auto_ingest: jobAutoIngest,
             after_date: jobAfterDate || undefined,
             before_date: jobBeforeDate || undefined,
@@ -216,7 +239,8 @@ export default function Dashboard() {
       } else {
         j = await api.jobs.create({
           takeout_url: jobUrl,
-          credential_id: jobCredId,
+          credential_id: destId,
+          destination_kind: destKind,
           auto_ingest: jobAutoIngest,
           after_date: jobAfterDate || undefined,
           before_date: jobBeforeDate || undefined,
@@ -300,12 +324,30 @@ export default function Dashboard() {
     }
   }
 
+  function deleteJobMessage(job: Job): string {
+    const blocks: string[] = []
+    if (job.status === 'running' || job.status === 'queued') {
+      blocks.push(`This job is currently ${job.status}.`)
+    }
+    if (job.is_sync_anchor) {
+      blocks.push(
+        'This import anchors a recurring iCloud sync. Deleting it will:\n' +
+        '  • Stop the scheduled sync on this iCloud connection\n' +
+        '  • Remove this job and its staged files',
+      )
+      blocks.push(
+        'Your iCloud connection and any photos already uploaded to Immich are NOT affected — ' +
+        'but automatic syncing will stop until you start a new import.',
+      )
+    } else {
+      blocks.push('This will remove the job and all of its staged files.')
+    }
+    blocks.push('This cannot be undone. Delete anyway?')
+    return blocks.join('\n\n')
+  }
+
   async function deleteJob(job: Job) {
-    const running = job.status === 'running' || job.status === 'queued'
-    const msg = running
-      ? `This job is currently ${job.status}. Deleting it will remove all staged files and cannot be undone. Continue?`
-      : 'Delete this job and all associated staged files? This cannot be undone.'
-    if (!confirm(msg)) return
+    if (!confirm(deleteJobMessage(job))) return
     await api.jobs.delete(job.job_id).catch(err => alert(err instanceof Error ? err.message : 'Delete failed'))
     setJobs(prev => prev.filter(j => j.job_id !== job.job_id))
   }
@@ -444,15 +486,21 @@ export default function Dashboard() {
         )}
       </section>
 
+      {/* WebDAV Destinations */}
+      <WebDavSection onDestsChange={setWebdavs} />
+
+      {/* Apple iCloud */}
+      <ICloudSection destinations={destOptions} onJobCreated={fetchJobs} />
+
       {/* Google Takeout Bundles */}
       <section>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-zinc-100">Google Takeout Bundles</h2>
           <button
             onClick={() => { setShowNewJob(v => !v); setJobMethod('url'); setJobFile(null); setJobError('') }}
-            disabled={creds.length === 0}
+            disabled={destOptions.length === 0}
             className={BTN_PRIMARY + ' disabled:opacity-40 disabled:cursor-not-allowed'}
-            title={creds.length === 0 ? 'Add an Immich connection first' : undefined}
+            title={destOptions.length === 0 ? 'Add an Immich or WebDAV destination first' : undefined}
           >
             {showNewJob ? 'Cancel' : 'Add bundle'}
           </button>
@@ -524,13 +572,13 @@ export default function Dashboard() {
             <div>
               <label className="block text-sm font-medium text-slate-700 dark:text-zinc-300 mb-1">Destination server</label>
               <select
-                value={jobCredId}
-                onChange={e => { setJobCredId(e.target.value); if (e.target.value) localStorage.setItem('psw:last-credential-id', e.target.value) }}
+                value={jobDest}
+                onChange={e => { setJobDest(e.target.value); if (e.target.value) localStorage.setItem('psw:last-dest', e.target.value) }}
                 required
                 className={INPUT}
               >
-                <option value="">Select a connection…</option>
-                {creds.map(c => <option key={c.id} value={c.id}>{c.label ?? c.server_url}</option>)}
+                <option value="">Select a destination…</option>
+                {destOptions.map(o => <option key={`${o.kind}:${o.id}`} value={`${o.kind}:${o.id}`}>{o.label}</option>)}
               </select>
             </div>
             <div className="border border-slate-200 dark:border-zinc-600 rounded-md p-4 space-y-3 bg-slate-50 dark:bg-zinc-800/30">
@@ -587,14 +635,19 @@ export default function Dashboard() {
           </form>
         )}
 
+      </section>
+
+      {/* Imports (all sources: Google, iCloud direct + bundle, rollbacks) */}
+      <section>
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-zinc-100 mb-4">Imports</h2>
         {jobs.length === 0 ? (
-          <p className="text-sm text-slate-500 dark:text-zinc-400">No bundles yet.</p>
+          <p className="text-sm text-slate-500 dark:text-zinc-400">No imports yet.</p>
         ) : (
           <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg overflow-hidden">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 dark:bg-zinc-800 border-b border-slate-200 dark:border-zinc-700">
                 <tr>
-                  {['Stage', 'Status', 'Progress', 'Date filter', 'Started', 'Error', 'Action'].map(h => (
+                  {['Source', 'Stage', 'Status', 'Progress', 'Date filter', 'Started', 'Error', 'Action'].map(h => (
                     <th key={h} className="text-left px-4 py-3 font-medium text-slate-600 dark:text-zinc-400">{h}</th>
                   ))}
                 </tr>
@@ -608,6 +661,15 @@ export default function Dashboard() {
                   return (
                     <Fragment key={job.job_id}>
                       <tr className="odd:bg-white dark:odd:bg-zinc-900 even:bg-slate-50 dark:even:bg-zinc-800/40">
+                        <td className="px-4 py-3">
+                          <div className="flex flex-col gap-0.5">
+                            <Badge
+                              text={SOURCE_LABELS[job.source ?? 'google_takeout'] ?? 'Google'}
+                              color={SOURCE_COLORS[job.source ?? 'google_takeout'] ?? SOURCE_COLORS.google_takeout}
+                            />
+                            <span className="text-xs text-slate-400 dark:text-zinc-500 pl-0.5">→ {destinationLabel(job)}</span>
+                          </div>
+                        </td>
                         <td className="px-4 py-3">
                           <Badge text={job.stage} color={STAGE_COLORS[job.stage] ?? 'bg-slate-100 text-slate-600 dark:bg-zinc-700 dark:text-zinc-300'} />
                         </td>
@@ -624,8 +686,9 @@ export default function Dashboard() {
                               </span>
                               {job.stage === 'fetch' && job.status === 'running' && job.processed_items > 0 && (
                                 <span className="text-xs text-slate-400 dark:text-zinc-500 pl-1">
-                                  {(job.processed_items / 1048576).toFixed(1)}
-                                  {job.total_items != null ? ` / ${(job.total_items / 1048576).toFixed(1)}` : ''} MB
+                                  {job.source === 'icloud_direct'
+                                    ? `${job.processed_items.toLocaleString()} photos`
+                                    : `${(job.processed_items / 1048576).toFixed(1)}${job.total_items != null ? ` / ${(job.total_items / 1048576).toFixed(1)}` : ''} MB`}
                                 </span>
                               )}
                             </div>
@@ -681,7 +744,7 @@ export default function Dashboard() {
                       </tr>
                       {rerunJobId === job.job_id && (
                         <tr className="bg-slate-50 dark:bg-zinc-800/60 border-t border-slate-100 dark:border-zinc-700">
-                          <td colSpan={7} className="px-4 py-4">
+                          <td colSpan={8} className="px-4 py-4">
                             <form onSubmit={submitRerun} className="flex flex-wrap items-end gap-3">
                               <p className="w-full text-xs text-slate-500 dark:text-zinc-400">
                                 Adjust the date range and re-run the upload step. Staging files are preserved — no re-download needed.
@@ -732,12 +795,14 @@ export default function Dashboard() {
                       )}
                       {rollbackJobId === job.job_id && (
                         <tr className="bg-rose-50 dark:bg-rose-950/20 border-t border-rose-100 dark:border-rose-900/30">
-                          <td colSpan={7} className="px-4 py-4">
+                          <td colSpan={8} className="px-4 py-4">
                             <form onSubmit={submitRollback} className="flex flex-wrap items-end gap-3">
                               <div className="w-full space-y-1">
-                                <p className="text-xs font-semibold text-rose-700 dark:text-rose-400">Remove imported assets from Immich</p>
+                                <p className="text-xs font-semibold text-rose-700 dark:text-rose-400">Remove imported assets from {destinationLabel(job)}</p>
                                 <p className="text-xs text-slate-500 dark:text-zinc-400">
-                                  This permanently deletes assets from Immich that were uploaded by this job. Assets that were pre-existing duplicates in Immich are not affected.
+                                  {job.destination_kind === 'webdav'
+                                    ? 'This deletes the files this job uploaded to the WebDAV destination, by path (including album-folder copies).'
+                                    : 'This permanently deletes assets from Immich that were uploaded by this job. Assets that were pre-existing duplicates in Immich are not affected.'}
                                 </p>
                               </div>
                               <div>
@@ -777,7 +842,7 @@ export default function Dashboard() {
                                   disabled={rollbackLoading}
                                   className="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50"
                                 >
-                                  {rollbackLoading ? 'Rolling back…' : 'Remove from Immich'}
+                                  {rollbackLoading ? 'Rolling back…' : `Remove from ${destinationLabel(job)}`}
                                 </button>
                                 <button
                                   type="button"

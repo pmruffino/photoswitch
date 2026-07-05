@@ -16,10 +16,48 @@ export interface ImmichCred {
   created_at: string
 }
 
+export interface WebDavDest {
+  id: string
+  base_url: string
+  username: string
+  base_path: string
+  label: string | null
+  created_at: string
+}
+
+// A destination for selection UIs — unifies Immich + WebDAV by (kind, id).
+export interface DestOption {
+  kind: 'immich' | 'webdav'
+  id: string
+  label: string
+}
+
+export function toDestOptions(immich: ImmichCred[], webdav: WebDavDest[]): DestOption[] {
+  return [
+    ...immich.map(c => ({ kind: 'immich' as const, id: c.id, label: `${c.label ?? c.server_url} (Immich)` })),
+    ...webdav.map(d => ({ kind: 'webdav' as const, id: d.id, label: `${d.label ?? d.base_url} (WebDAV)` })),
+  ]
+}
+
 export interface DateFilter {
   after_date: string | null
   before_date: string | null
   include_undated: boolean
+}
+
+export interface ICloudConnection {
+  id: string
+  apple_id: string
+  label: string | null
+  status: 'pending_2fa' | '2fa_required' | 'active' | 'needs_reauth'
+  sync_enabled: boolean
+  sync_interval_minutes: number
+  sync_credential_id: string | null
+  sync_credential_kind?: 'immich' | 'webdav'
+  sync_last_run_at: string | null
+  anchor_job_id: string | null
+  has_watermark: boolean
+  created_at: string
 }
 
 export interface Job {
@@ -32,6 +70,9 @@ export interface Job {
   error: string | null
   date_filter: DateFilter | null
   auto_ingest: boolean
+  source?: 'google_takeout' | 'icloud_bundle' | 'icloud_direct'
+  destination_kind?: 'immich' | 'webdav'
+  is_sync_anchor?: boolean
   created_at: string
   updated_at?: string
 }
@@ -66,7 +107,7 @@ const CHUNK_SIZE = 50 * 1024 * 1024  // 50 MB per chunk
 
 export async function uploadJobChunked(
   file: File,
-  params: { credential_id: string; auto_ingest: boolean; after_date?: string; before_date?: string },
+  params: { credential_id: string; destination_kind?: string; auto_ingest: boolean; after_date?: string; before_date?: string; source?: string },
   onProgress: (pct: number) => void,
 ): Promise<Job> {
   const initRes = await fetch('/api/jobs/upload/session', {
@@ -142,10 +183,33 @@ export const api = {
       req<ImmichCred>('PATCH', `/user/immich/${id}`, data),
     deleteImmich: (id: string) => req<void>('DELETE', `/user/immich/${id}`),
     testImmich: (id: string) => req<{ ok: boolean; user?: string }>('POST', `/user/immich/${id}/test`),
+    listWebdav: () => req<WebDavDest[]>('GET', '/user/webdav'),
+    addWebdav: (data: { base_url: string; username: string; password: string; base_path?: string; label?: string }) =>
+      req<WebDavDest>('POST', '/user/webdav', data),
+    updateWebdav: (id: string, data: { base_url?: string; username?: string; password?: string; base_path?: string; label?: string }) =>
+      req<WebDavDest>('PATCH', `/user/webdav/${id}`, data),
+    deleteWebdav: (id: string) => req<void>('DELETE', `/user/webdav/${id}`),
+    testWebdav: (id: string) => req<{ ok: boolean; user?: string }>('POST', `/user/webdav/${id}/test`),
+  },
+  icloud: {
+    listConnections: () => req<ICloudConnection[]>('GET', '/icloud/connections'),
+    createConnection: (data: { apple_id: string; password: string; label?: string }) =>
+      req<ICloudConnection>('POST', '/icloud/connections', data),
+    verifyConnection: (id: string, code: string) =>
+      req<ICloudConnection>('POST', `/icloud/connections/${id}/verify`, { code }),
+    testConnection: (id: string) =>
+      req<{ ok: boolean; user?: string }>('POST', `/icloud/connections/${id}/test`),
+    deleteConnection: (id: string) => req<void>('DELETE', `/icloud/connections/${id}`),
+    configureSync: (id: string, data: { enabled: boolean; interval_minutes: number; credential_id?: string; destination_kind?: string }) =>
+      req<ICloudConnection>('PUT', `/icloud/connections/${id}/sync`, data),
+    importNow: (id: string, data: { credential_id: string; destination_kind?: string; as_sync_anchor?: boolean; after_date?: string; before_date?: string }) =>
+      req<{ job_id: string; connection_id: string }>('POST', `/icloud/connections/${id}/import`, data),
+    syncNow: (id: string) =>
+      req<{ job_id: string; connection_id: string }>('POST', `/icloud/connections/${id}/sync-now`),
   },
   jobs: {
     list: () => req<Job[]>('GET', '/jobs/'),
-    create: (data: { takeout_url: string; credential_id: string; auto_ingest?: boolean; after_date?: string; before_date?: string }) =>
+    create: (data: { takeout_url: string; credential_id: string; destination_kind?: string; auto_ingest?: boolean; after_date?: string; before_date?: string }) =>
       req<Job>('POST', '/jobs/', data),
     get: (id: string) => req<Job>('GET', `/jobs/${id}`),
     resume: (id: string) => req<Job>('POST', `/jobs/${id}/resume`),

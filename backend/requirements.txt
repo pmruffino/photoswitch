@@ -8,3 +8,7 @@ argon2-cffi>=23.1
 cryptography>=42.0
 python-multipart>=0.0.9
 httpx>=0.27
+# iCloud connect / 2FA auth (icloud_router). Mainline pyicloud (modern 2FA +
+# cookie-dir session API). Native deps resolve to glibc manylinux wheels in the
+# Chainguard python -dev build stage.
+pyicloud>=2.6

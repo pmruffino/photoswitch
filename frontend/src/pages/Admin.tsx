@@ -26,33 +26,39 @@ const POLICY_LABELS: Record<string, string> = {
   closed: 'Closed — admin creates accounts only',
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  google_takeout: 'Google',
+  icloud_direct: 'iCloud',
+  icloud_bundle: 'iCloud bundle',
+}
+
 type StageName = 'fetch' | 'unpack' | 'map' | 'load' | 'rollback'
 
 const STAGE_CONFIGS: { stage: StageName; label: string; description: string }[] = [
   {
     stage: 'fetch',
     label: 'Fetch',
-    description: 'Downloads the Takeout archive from the user-provided URL. Bottleneck is outbound bandwidth and the Google Drive rate limit.',
+    description: 'Downloads a Google Takeout archive from the user URL, or pulls new photos from an iCloud connection. Bottleneck is outbound bandwidth and the remote provider’s rate limits.',
   },
   {
     stage: 'unpack',
     label: 'Unpack',
-    description: 'Streams the archive to disk. I/O-bound on the staging volume; CPU is minimal.',
+    description: 'Streams the archive to disk (Google / iCloud export bundles). I/O-bound on the staging volume; CPU is minimal. Skipped for iCloud direct pulls.',
   },
   {
     stage: 'map',
     label: 'Map',
-    description: 'Pairs each file with its Google JSON sidecar and rewrites EXIF via exiftool. CPU-bound — benefits most from additional workers.',
+    description: 'Writes correct EXIF via exiftool from Google sidecars, the iCloud manifest, or embedded metadata. CPU-bound — benefits most from additional workers.',
   },
   {
     stage: 'load',
     label: 'Load',
-    description: 'Uploads assets to your Immich server. Bottleneck is network throughput and Immich ingestion speed.',
+    description: 'Uploads assets to the destination (Immich API or WebDAV). Bottleneck is network throughput and the destination’s ingestion speed.',
   },
   {
     stage: 'rollback',
     label: 'Rollback',
-    description: 'Removes previously uploaded assets from Immich. Usually fast; 1–2 workers is sufficient.',
+    description: 'Removes a job’s previously uploaded assets from the destination (Immich or WebDAV). Usually fast; 1–2 workers is sufficient.',
   },
 ]
 
@@ -489,7 +495,7 @@ export default function Admin() {
                     </div>
                     <input type="range" min={1} max={200} value={maxTakeoutGb} onChange={e => setMaxTakeoutGb(Number(e.target.value))} className="w-full accent-red-600" />
                     <p className="text-xs text-slate-400 dark:text-zinc-500 mt-0.5">
-                      Downloads that exceed this size are rejected immediately. A typical Google Photos export is 10–50 GB.
+                      Downloads/uploads that exceed this size are rejected immediately. A typical Google Photos export is 10–50 GB. (Applies to Google &amp; export-bundle archives; iCloud direct pulls stream photo-by-photo and are not bound by this limit.)
                     </p>
                   </div>
                   <div>
@@ -578,7 +584,7 @@ export default function Admin() {
               <table className="w-full text-sm">
                 <thead className="bg-slate-50 dark:bg-zinc-800 border-b border-slate-200 dark:border-zinc-700">
                   <tr>
-                    {['User', 'Stage', 'Status', 'Progress', 'Started', 'Error', ''].map((h, i) => (
+                    {['User', 'Source', 'Stage', 'Status', 'Progress', 'Started', 'Error', ''].map((h, i) => (
                       <th key={i} className="text-left px-4 py-3 font-medium text-slate-600 dark:text-zinc-400">{h}</th>
                     ))}
                   </tr>
@@ -589,6 +595,10 @@ export default function Admin() {
                     return (
                       <tr key={job.job_id} className="odd:bg-white dark:odd:bg-zinc-900 even:bg-slate-50 dark:even:bg-zinc-800/40">
                         <td className="px-4 py-3 font-medium text-slate-900 dark:text-zinc-100">{job.username}</td>
+                        <td className="px-4 py-3 text-slate-500 dark:text-zinc-400 whitespace-nowrap">
+                          {SOURCE_LABELS[job.source ?? 'google_takeout'] ?? 'Google'}
+                          <span className="text-slate-400 dark:text-zinc-500"> → {job.destination_kind === 'webdav' ? 'WebDAV' : 'Immich'}</span>
+                        </td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${STAGE_COLORS[job.stage] ?? 'bg-slate-100 text-slate-600 dark:bg-zinc-700 dark:text-zinc-300'}`}>
                             {job.stage}
@@ -605,8 +615,9 @@ export default function Admin() {
                               </span>
                               {job.stage === 'fetch' && job.status === 'running' && job.processed_items > 0 && (
                                 <span className="text-xs text-slate-400 dark:text-zinc-500 pl-1">
-                                  {(job.processed_items / 1048576).toFixed(1)}
-                                  {job.total_items != null ? ` / ${(job.total_items / 1048576).toFixed(1)}` : ''} MB
+                                  {job.source === 'icloud_direct'
+                                    ? `${job.processed_items.toLocaleString()} photos`
+                                    : `${(job.processed_items / 1048576).toFixed(1)}${job.total_items != null ? ` / ${(job.total_items / 1048576).toFixed(1)}` : ''} MB`}
                                 </span>
                               )}
                             </div>

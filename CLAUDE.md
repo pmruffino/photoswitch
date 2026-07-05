@@ -1,26 +1,58 @@
 # Photoswitch
 
-Middleware that ingests photos + metadata from Google Photos (via Google Takeout)
-into one or more Immich servers. Built as a small, modular, multi-tenant stack so
-that worker stages can scale out independently and per-user jobs run in parallel.
+Middleware that ingests photos + metadata from Google Photos (via Google Takeout) and
+Apple iCloud (via Apple Data & Privacy export or a direct iCloud connection) into one
+or more destination servers — Immich, or a WebDAV target (Nextcloud, ownCloud,
+PhotoPrism). Built as a small, modular, multi-tenant stack so that worker stages can
+scale out independently and per-user jobs run in parallel.
 
 This file is read automatically by Claude Code each session. Keep it current — it is
 the single source of truth for architecture and locked decisions.
 
-**Status:** Renamed/relaunched from the prior `immich-switch` codebase. All pipeline
-stages are implemented; no backward compatibility with the old name was preserved
-(internal naming — Redis namespace, Postgres DB, Immich `deviceId` — changed too,
-since this rename happened before any production deployment under the new name).
+**Status:** All pipeline stages are implemented. Sources: Google Takeout (link or
+upload), Apple iCloud (direct connection + Apple Data & Privacy export bundle).
+Destinations: Immich and WebDAV (Nextcloud / ownCloud / PhotoPrism). Periodic iCloud
+sync is implemented via the backend scheduler. The Apple iCloud UI lives in
+`frontend/src/components/ICloudSection.tsx`; WebDAV destinations in
+`frontend/src/components/WebDavSection.tsx`.
+
+**Not yet verified against live third-party services:** the iCloud direct-connection
+auth/2FA + photo pull (built against mainline `pyicloud` v2.6.5, API surface
+confirmed by introspection but not exercised with a real Apple account) and the WebDAV
+upload/COPY/rollback path (unit-tested against a mock transport, not yet against a live
+Nextcloud/ownCloud/PhotoPrism). The Google Takeout → Immich path is the
+battle-tested one.
 
 ---
 
 ## Goal
 
-A user provides their Google Takeout export — either as a public share link or by
-uploading the archive directly. The app fetches/receives it, unpacks it, maps Google's
-JSON sidecar metadata onto the media files (EXIF/QuickTime), and uploads the result
-into the user's chosen Immich server with correct timestamps, GPS, descriptions, and
-album membership. A rollback stage can remove previously uploaded assets from Immich.
+A user provides a photo library from one of two sources and the app imports it into
+the user's chosen Immich server with correct timestamps, GPS, descriptions, and album
+membership. A rollback stage can remove previously uploaded assets from Immich.
+
+**Google Photos (implemented).** The user provides their Google Takeout export —
+either as a public share link or by uploading the archive directly. The app
+fetches/receives it, unpacks it, maps Google's JSON sidecar metadata onto the media
+files (EXIF/QuickTime), and uploads the result.
+
+**Apple iCloud (planned, `icloud` branch).** The user connects iCloud one of two ways:
+
+1. **Direct cloud connection** — the app authenticates to iCloud (Apple ID sign-in
+   with 2FA; there is no OAuth for iCloud Photos, so a session-based client is
+   required) and pulls the photo library directly. Metadata (timestamps, GPS,
+   descriptions, album membership) comes from the iCloud Photos API rather than JSON
+   sidecars.
+2. **Downloaded export bundle** — the user requests an export from the **Apple Data &
+   Privacy** portal (privacy.apple.com → "Get a copy of your data"; Apple has no
+   "Takeout"-style brand name for it), then uploads the resulting archive directly,
+   the same way a Takeout archive is uploaded. The bundle carries metadata in Apple's
+   own layout, which the mapper normalises before upload.
+
+Both iCloud paths converge on the same Loader → Immich upload (and Rollback) as the
+Google path. In addition, an iCloud **direct connection** import can be set up as a
+recurring **periodic sync** so that new photos added to iCloud are imported into
+Immich on a schedule — see Locked decisions.
 
 The whole thing runs as **one Docker Compose stack** on an Unraid server or other
 Docker host.
@@ -45,9 +77,14 @@ React SPA ──► FastAPI (control plane, 1 instance)
 
 ### Pipeline stages (each an independent worker type)
 
-1. **Fetcher** (`workers/fetcher.py`) — pulls the Takeout archive from the
-   user-provided public link into a per-user staging path. Stateless, idempotent.
-   If `auto_ingest=False`, parks the job after download instead of advancing.
+1. **Fetcher** (`workers/fetcher.py`) — **source-aware**. For Google jobs it pulls
+   the Takeout archive from the user-provided public link into a per-user staging path
+   (stateless, idempotent; if `auto_ingest=False`, parks the job after download). For
+   `ICLOUD_DIRECT` jobs it opens the connection's stored session (`icloud_client.py`),
+   incrementally pulls photos newer than the connection's watermark straight into the
+   extracted dir, writes `icloud_manifest.json`, and advances the watermark. Because a
+   direct pull has no archive, its pipeline skips UNPACK (`next_stage()` in
+   `schemas.py` routes `FETCH → MAP` for `ICLOUD_DIRECT`).
 2. **Unpacker** (`workers/unpacker.py`) — stream-extracts the `.tgz`/`.zip` into
    media files + `.json` sidecars. Streams where possible to avoid double-inflating.
 3. **Metadata Mapper** (`workers/mapper/`) — THE CORE. Pairs each media file with
@@ -55,22 +92,35 @@ React SPA ──► FastAPI (control plane, 1 instance)
    description. Records album membership for the Loader. Handles edge cases: Live
    Photos / motion photos, `-edited` variants vs originals, truncated/duplicated
    filenames, `supplemental-metadata` naming. Outputs `mapped_assets.json`.
-4. **Loader** (`workers/loader.py`) — uploads assets via the Immich API
-   (`POST /api/assets`), dedupes by checksum, creates/joins albums. Respects the
-   optional `date_filter` on the job to selectively upload by date range.
-5. **Rollback** (`workers/rollback.py`) — removes previously loaded assets from
-   Immich. Reads `mapped_assets.json` from the source job's staging dir, uses
-   `POST /api/assets/bulk-upload-check` to find existing assets by checksum, verifies
-   ownership via `deviceId`/`deviceAssetId`, then batch-deletes with `force=true`
-   (permanent delete, bypasses Immich's trash). Does NOT follow the main pipeline sequence — it has no
-   `next` stage and `max_attempts=1`.
+   Source-aware: `ICLOUD_DIRECT` jobs are mapped from the Fetcher's
+   `icloud_manifest.json` (metadata came from the iCloud API, not sidecars);
+   `ICLOUD_BUNDLE` (Apple Data & Privacy export) has no sidecars, so it flows through
+   the same file-scan path as Google and relies on the existing embedded-EXIF fallback
+   plus folder-name album detection.
+4. **Loader** (`workers/loader.py`) — uploads assets to the job's destination.
+   **Dispatches by `target.kind`** (see Destinations): for `immich` it uses the Immich
+   API (`POST /api/assets`), dedupes by checksum, creates/joins albums; for `webdav`
+   it uses `workers/webdav.py` to PUT files into folders. Respects the optional
+   `date_filter` on the job to selectively upload by date range.
+5. **Rollback** (`workers/rollback.py`) — removes previously loaded assets from the
+   destination. **Dispatches by `target.kind`**: for `immich` it reads
+   `mapped_assets.json`, uses `POST /api/assets/bulk-upload-check` to find assets by
+   checksum, verifies ownership via `deviceId`/`deviceAssetId`, then batch-deletes with
+   `force=true` (permanent, bypasses trash); for `webdav` it deletes the uploaded files
+   by path. Does NOT follow the main pipeline sequence — it has no `next` stage and
+   `max_attempts=1`.
 
 ### Control plane
 
 - **FastAPI** backend (`backend/`) — async, single instance. Handles auth, job
   creation, state reads/writes, and job enqueueing. Does no heavy lifting.
   Built on Chainguard's hardened `cgr.dev/chainguard/python` images (two-stage:
-  `-dev` variant to pip-install, distroless runtime variant to serve).
+  `-dev` variant to pip-install, distroless runtime variant to serve). Runs two
+  background loops in its lifespan: the daily **staging cleanup** and the
+  **periodic-sync scheduler** (`_sync_scheduler_loop` in `main.py`), which enqueues a
+  fresh `ICLOUD_DIRECT` job whenever an iCloud connection's sync is enabled and due.
+  Because the backend is single-instance, the in-progress iCloud 2FA service is held
+  in a module dict between the connect and verify requests.
 - **React + TypeScript SPA** (`frontend/`) — Tailwind CSS, full admin + user UI.
   Served by nginx which also reverse-proxies `/api/` to the backend. Built on
   Chainguard's `cgr.dev/chainguard/node` (build stage) and `cgr.dev/chainguard/nginx`
@@ -124,6 +174,50 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
 - **Takeout input:** public share link (no Google OAuth). User pastes the link or
   uploads the archive directly via chunked multipart upload. Tradeoff accepted: user
   manages link lifecycle and should unshare after ingest.
+- **Source routing:** `Source` enum in `schemas.py` (`google_takeout`,
+  `icloud_bundle`, `icloud_direct`) is carried on every `Job` and selects its stage
+  pipeline via `PIPELINES` / `next_stage()`. Google and bundle use
+  `FETCH→UNPACK→MAP→LOAD`; direct uses `FETCH→MAP→LOAD` (no archive to unpack).
+  `Job.advance()` is source-aware; `Stage.next` is a back-compat shim for the Google
+  order. Old serialized jobs with no `source` default to `google_takeout`.
+- **iCloud input:** two modes, both feeding the same Loader as Google.
+  - **Direct connection** — Apple ID sign-in with 2FA (no OAuth exists for iCloud
+    Photos, so the mainline `pyicloud` library is used, borrowing icloudpd's session
+    and incremental-pull patterns). Connect is a
+    two-step flow: `POST /api/icloud/connections` starts auth; `POST
+    /connections/{id}/verify` submits the 6-digit code. The resulting **trusted
+    session** (a packed pyicloud cookie directory) and the Apple password are stored
+    encrypted at rest on the `icloud_connections` row, reusing the same Fernet key as
+    Immich credentials, so subsequent pulls skip 2FA. Apple expires trust ~every 2
+    months; the connection is then flagged `needs_reauth`. Metadata comes from the
+    iCloud API (not sidecars) and reaches the Mapper via `icloud_manifest.json`.
+  - **Export bundle** — user requests an export from the Apple Data & Privacy portal
+    (privacy.apple.com → "Get a copy of your data") and uploads the archive via the
+    existing chunked-upload flow with `source=icloud_bundle`. Reuses unpack + map +
+    load unchanged (Apple embeds metadata in-file, so no sidecar parsing is needed).
+- **Periodic sync (iCloud direct connection only):** configured per connection via
+  `PUT /api/icloud/connections/{id}/sync` (enabled, interval, Immich target). The
+  backend scheduler (`_sync_scheduler_loop`, tick `SYNC_SCHEDULER_TICK_SECONDS` = 120 s)
+  enqueues a normal `ICLOUD_DIRECT` fetch→map→load job whenever a connection is enabled
+  and due; the Fetcher pulls only assets newer than the stored `watermark_ms` (Immich
+  checksum-dedup on the Loader is the backstop). Interval is restricted to fixed
+  presets `SYNC_INTERVAL_PRESETS` (15 min, 1/2/4/8/12 h, 1/2/3 day, 1 week; floor
+  `SYNC_MIN_INTERVAL_MINUTES` = 15). A per-connection Redis lock plus DB
+  `sync_last_run_at` prevent double-firing. There is **no dedicated sync worker** and
+  no `SYNC` stage — recurrence is purely a control-plane scheduling concern; the
+  Fetcher does the incremental pull and the Loader still uploads. `POST
+  /connections/{id}/sync-now` runs the sync on demand (uses the configured sync
+  target, updates `sync_last_run_at`). An import can be designated the sync **anchor**
+  (`is_sync_anchor`, `POST /connections/{id}/import` with `as_sync_anchor=true`);
+  anchor jobs are **exempt from staging cleanup** so the recurring sync's visible
+  record survives the retention window. Export-bundle imports are one-shot and cannot
+  be scheduled. The sync watermark lives on the connection row, so per-run staging
+  cleanup never breaks an in-progress sync.
+- **Sync teardown:** deleting a sync-anchor job (`DELETE /api/jobs/{id}`) cleanly
+  removes the schedule — it disables `sync_enabled`, clears `anchor_job_id`, and drops
+  the per-connection Redis lock on the owning `icloud_connections` row. Deleting the
+  connection itself (`DELETE /api/icloud/connections/{id}`) also clears the lock. Both
+  paths guarantee the scheduler cannot fire for a removed sync.
 - **Build approach:** from scratch (not wrapping immich-go).
 - **Run model:** manual trigger. Designed so an external scheduler can kick jobs.
 - **Multi-tenant:** jobs are keyed by user. Per-user worker scoping is supported.
@@ -135,6 +229,30 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   - `user` — connect Takeout source + Immich server, trigger jobs, view own status.
   - `admin` — everything a user can do, plus: manage users, set concurrency limits,
     configure staging retention and max archive size.
+- **Destinations:** a job uploads to a **destination**, identified by
+  `Destination.kind` in `schemas.py` (`DestinationKind`: `immich` | `webdav`). The
+  Loader and Rollback dispatch on `kind`; everything upstream (Fetcher/Unpacker/Mapper)
+  is destination-agnostic and unchanged. Two kinds are supported:
+  - **`immich`** — the original path (see Immich connection below).
+  - **`webdav`** — covers **Nextcloud, ownCloud, and PhotoPrism** (and any WebDAV
+    server) through one implementation. Credentials live in `webdav_destinations`
+    (base URL, username, encrypted password/app-password, base upload folder). The
+    Loader (`workers/webdav.py`) uploads the mapped files by `PUT` into folders;
+    because the Mapper already bakes timestamp/GPS/description into each file's
+    EXIF/QuickTime, that metadata travels with the upload and Nextcloud
+    Memories/PhotoPrism index it — no destination-side metadata API needed.
+    - **Albums are folder-based (v1):** an album named `A` becomes the folder
+      `{base}/A/`; un-albumed photos go in `{base}/`. Native Nextcloud album APIs are
+      deliberately out of scope for v1.
+    - **A photo in multiple albums is uploaded once.** The bytes are `PUT` a single
+      time to the first album's folder; membership in every other album is a
+      **server-side WebDAV `COPY`** (no client re-upload). Folder albums do duplicate
+      the file in server storage — unavoidable without native albums — but the
+      network upload happens once. If a server rejects `COPY` (e.g. some PhotoPrism
+      setups), the extra album membership is skipped with a warning rather than
+      re-uploading. Re-runs are idempotent: existing target paths are skipped.
+    - **No checksum dedup** (WebDAV has none); dedup is by target path/name plus the
+      source-side watermark. **Rollback** deletes the uploaded files by path.
 - **Immich connection:** user pastes their Immich server URL + API key generated in
   their own Immich account (Account Settings → API Keys). Stored encrypted in
   Postgres. All httpx calls to Immich use `verify=False, follow_redirects=True` so
@@ -176,15 +294,22 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   using `hashlib.sha256`.
 - **Datastores:**
   - **Postgres** — users, password hashes, roles, approval state, encrypted Immich
-    credentials, job history (`job_records` table).
+    credentials (`immich_credentials`), encrypted WebDAV destinations
+    (`webdav_destinations`: base URL, username, encrypted password, base upload
+    folder), encrypted iCloud connections + sessions (`icloud_connections` table:
+    Apple ID, encrypted password, encrypted trusted session, status, sync-watermark,
+    sync schedule + target), job history (`job_records` table).
   - **Redis** — queues, semaphores, live config, sessions, live job state.
 - **Live job state:** canonical job state lives in Redis (`psw:job:{id}`). Postgres
   `job_records` is updated at stage transitions for durable history. The dashboard
   reads from Redis for live progress.
 - **Staging cleanup:** a background task in the backend runs daily at a configurable
   hour (default 3 AM UTC). Removes terminal jobs older than the retention window
-  (default 7 days). Jobs with a date filter are excluded. Orphaned staging dirs
-  (no DB record) are also pruned.
+  (admin-selectable, default 7 days). Jobs with a date filter are excluded, as are
+  **sync-anchor jobs** (`is_sync_anchor`) so a recurring iCloud sync keeps its visible
+  record. Ordinary per-run sync jobs are cleaned normally — the sync watermark lives
+  on the `icloud_connections` row, not in staging, so this never breaks a sync.
+  Orphaned staging dirs (no DB record) are also pruned.
 - **nginx DNS:** the frontend nginx uses `resolver 127.0.0.11 valid=10s` and a
   `set $backend_upstream` variable so it re-resolves the backend hostname after
   container restarts instead of caching the IP at startup.

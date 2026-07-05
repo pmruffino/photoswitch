@@ -216,6 +216,8 @@ def _job_out(record: JobRecord, live: dict | None, username: str) -> dict:
         "updated_at": record.updated_at.isoformat(),
         "date_filter": None,
         "auto_ingest": True,
+        "source": "google_takeout",
+        "destination_kind": "immich",
     }
     if live:
         out["stage"] = live.get("stage", out["stage"])
@@ -226,6 +228,8 @@ def _job_out(record: JobRecord, live: dict | None, username: str) -> dict:
         out["error"] = live.get("error") or out["error"]
         out["date_filter"] = live.get("date_filter")
         out["auto_ingest"] = live.get("auto_ingest", True)
+        out["source"] = live.get("source", out["source"])
+        out["destination_kind"] = (live.get("target") or {}).get("kind", out["destination_kind"])
     return out
 
 

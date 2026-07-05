@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
 from dependencies import get_db, get_current_user, get_redis
-from models import User, ImmichCredential, JobRecord
+from models import User, ImmichCredential, WebDavDestination, JobRecord
 from auth import hash_password, verify_password, delete_session
 from crypto import encrypt, decrypt
 from schemas import job_key, user_jobs_key
@@ -292,3 +292,147 @@ async def test_immich(
             raise HTTPException(status_code=502, detail=f"Server reachable but /api/users/me returned HTTP {me.status_code}")
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Could not reach server at {base}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# WebDAV destinations (Nextcloud / ownCloud / PhotoPrism / any WebDAV server)
+# ---------------------------------------------------------------------------
+
+class AddWebDavRequest(BaseModel):
+    base_url: str
+    username: str
+    password: str
+    base_path: str = "Photoswitch"
+    label: str | None = None
+
+
+class UpdateWebDavRequest(BaseModel):
+    base_url: str | None = None
+    username: str | None = None
+    password: str | None = None
+    base_path: str | None = None
+    label: str | None = None
+
+
+def _webdav_out(d: WebDavDestination) -> dict:
+    return {
+        "id": str(d.id),
+        "base_url": d.base_url,
+        "username": d.username,
+        "base_path": d.base_path,
+        "label": d.label,
+        "created_at": d.created_at.isoformat(),
+    }
+
+
+async def _get_webdav(db: AsyncSession, user: User, dest_id: str) -> WebDavDestination:
+    try:
+        did = uuid.UUID(dest_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    d = (await db.execute(
+        select(WebDavDestination).where(
+            WebDavDestination.id == did, WebDavDestination.user_id == user.id
+        )
+    )).scalar_one_or_none()
+    if not d:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return d
+
+
+@router.get("/webdav")
+async def list_webdav(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WebDavDestination)
+        .where(WebDavDestination.user_id == user.id)
+        .order_by(WebDavDestination.created_at)
+    )
+    return [_webdav_out(d) for d in result.scalars().all()]
+
+
+@router.post("/webdav", status_code=201)
+async def add_webdav(
+    body: AddWebDavRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url must start with http:// or https://")
+    dest = WebDavDestination(
+        user_id=user.id,
+        base_url=body.base_url.rstrip("/"),
+        username=body.username,
+        encrypted_password=encrypt(body.password),
+        base_path=(body.base_path or "Photoswitch").strip("/") or "Photoswitch",
+        label=body.label or None,
+    )
+    db.add(dest)
+    await db.commit()
+    await db.refresh(dest)
+    return _webdav_out(dest)
+
+
+@router.patch("/webdav/{dest_id}")
+async def update_webdav(
+    dest_id: str,
+    body: UpdateWebDavRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    dest = await _get_webdav(db, user, dest_id)
+    if body.base_url is not None:
+        if not body.base_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="base_url must start with http:// or https://")
+        dest.base_url = body.base_url.rstrip("/")
+    if body.username is not None:
+        dest.username = body.username
+    if body.password:
+        dest.encrypted_password = encrypt(body.password)
+    if body.base_path is not None:
+        dest.base_path = body.base_path.strip("/") or "Photoswitch"
+    if body.label is not None:
+        dest.label = body.label or None
+    await db.commit()
+    await db.refresh(dest)
+    return _webdav_out(dest)
+
+
+@router.delete("/webdav/{dest_id}", status_code=204)
+async def delete_webdav(
+    dest_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    dest = await _get_webdav(db, user, dest_id)
+    await db.delete(dest)
+    await db.commit()
+
+
+@router.post("/webdav/{dest_id}/test")
+async def test_webdav(
+    dest_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    dest = await _get_webdav(db, user, dest_id)
+    password = decrypt(dest.encrypted_password)
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True,
+                                     auth=(dest.username, password)) as client:
+            # PROPFIND depth 0 on the root is the standard WebDAV liveness/auth probe.
+            resp = await client.request(
+                "PROPFIND", dest.base_url, headers={"Depth": "0"},
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach WebDAV server at {dest.base_url}: {exc}")
+
+    if resp.status_code in (207, 200):
+        return {"ok": True, "user": dest.username}
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=502, detail="Server reachable but credentials were rejected — check the username/app-password")
+    if resp.status_code == 405:
+        raise HTTPException(status_code=502, detail="Server reachable but did not accept PROPFIND — is base_url the WebDAV endpoint?")
+    raise HTTPException(status_code=502, detail=f"Server reachable but returned HTTP {resp.status_code}")

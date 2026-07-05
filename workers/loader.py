@@ -11,7 +11,8 @@ import asyncpg
 import httpx
 
 from base_worker import BaseWorker
-from schemas import DateFilter, Job, MappedAsset, Stage
+from schemas import DateFilter, DestinationKind, Job, MappedAsset, Stage
+from webdav import WebDavClient
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,50 @@ class LoaderWorker(BaseWorker):
             raw = json.load(f)
         assets = [MappedAsset.model_validate(a) for a in raw]
 
+        job.total_items = len(assets)
+        job.processed_items = 0
+
+        # Dispatch by destination kind — everything above (the mapped_assets contract)
+        # is identical across destinations.
+        if job.target.kind == DestinationKind.WEBDAV:
+            await self._load_webdav(job, assets)
+        else:
+            await self._load_immich(job, assets)
+
+    async def _get_webdav_creds(self, credential_ref: str) -> tuple[str, str, str, str]:
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT base_url, username, encrypted_password, base_path "
+                "FROM webdav_destinations WHERE id = $1::uuid",
+                credential_ref,
+            )
+        if not row:
+            raise ValueError(f"WebDAV destination {credential_ref} not found")
+        password = _make_fernet().decrypt(bytes(row["encrypted_password"])).decode()
+        return row["base_url"], row["username"], password, row["base_path"]
+
+    async def _load_webdav(self, job: Job, assets: list[MappedAsset]) -> None:
+        base_url, username, password, base_path = await self._get_webdav_creds(job.target.credential_ref)
+        date_filter: Optional[DateFilter] = job.date_filter
+        last_save = time.monotonic()
+
+        async with WebDavClient(base_url, username, password, base_path) as client:
+            for asset in assets:
+                if date_filter and not date_filter.includes(asset.taken_at):
+                    job.processed_items += 1
+                else:
+                    try:
+                        await client.upload_asset(asset)
+                    except Exception as exc:
+                        logger.warning("WebDAV upload failed for %s: %s", asset.file_path, exc)
+                    job.processed_items += 1
+
+                now = time.monotonic()
+                if now - last_save >= 5.0:
+                    await self.save_job(job)
+                    last_save = now
+
+    async def _load_immich(self, job: Job, assets: list[MappedAsset]) -> None:
         server_url, api_key = await self._get_api_key(job.target.credential_ref)
         base_url = server_url.rstrip("/")
         headers = {"x-api-key": api_key, "Accept": "application/json"}

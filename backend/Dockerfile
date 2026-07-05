@@ -21,8 +21,9 @@ WORKDIR /app
 
 COPY --from=build /app/packages /app/packages
 
-# schemas.py is shared; copy from project root
+# schemas.py and icloud_client.py are shared; copy from project root
 COPY schemas.py .
+COPY icloud_client.py .
 COPY backend/ .
 
 ENV PYTHONUNBUFFERED=1

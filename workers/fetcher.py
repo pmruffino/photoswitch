@@ -1,3 +1,7 @@
+import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
 import re
@@ -7,15 +11,147 @@ from urllib.parse import urlparse, unquote
 import httpx
 
 from base_worker import BaseWorker
-from schemas import Job, Stage, MAX_TAKEOUT_BYTES_KEY, DEFAULT_MAX_TAKEOUT_BYTES
+from schemas import Job, Source, Stage, MAX_TAKEOUT_BYTES_KEY, DEFAULT_MAX_TAKEOUT_BYTES
 
 logger = logging.getLogger(__name__)
+
+
+def _make_fernet():
+    """Same Fernet derivation the Loader uses — decrypts iCloud creds/session."""
+    from cryptography.fernet import Fernet
+    secret = os.environ["APP_SECRET_KEY"].encode()
+    derived = hashlib.sha256(secret).digest()
+    return Fernet(base64.urlsafe_b64encode(derived))
 
 
 class FetcherWorker(BaseWorker):
     stage = Stage.FETCH
 
     async def handle(self, job: Job) -> None:
+        if job.source == Source.ICLOUD_DIRECT:
+            await self._handle_icloud(job)
+        else:
+            await self._handle_url(job)
+
+    # -- iCloud direct pull ---------------------------------------------------
+
+    async def _handle_icloud(self, job: Job) -> None:
+        import icloud_client as ic
+
+        if not job.icloud_connection_ref:
+            raise ValueError("iCloud job has no connection reference")
+
+        staging_dir = os.path.join(self.staging_root, job.id)
+        extracted_dir = os.path.join(staging_dir, "extracted")
+        os.makedirs(extracted_dir, exist_ok=True)
+        job.staging_dir = staging_dir
+        job.processed_items = 0
+        job.total_items = None
+
+        apple_id, password, session_blob, watermark_ms = await self._load_connection(
+            job.icloud_connection_ref
+        )
+        if not session_blob:
+            raise ValueError("iCloud connection has no trusted session — re-authenticate in the UI")
+
+        cookie_dir = os.path.join(staging_dir, ".icloud_session")
+        ic.restore_session(session_blob, cookie_dir)
+
+        progress = {"n": 0}
+
+        def _pull():
+            api = ic.open_session(apple_id, password, cookie_dir)
+            return ic.pull_new_photos(
+                api, extracted_dir, since_ms=watermark_ms,
+                progress_cb=lambda n: progress.__setitem__("n", n),
+            )
+
+        # Run the blocking network/disk pull off the event loop, saving progress
+        # every 5 s (same pattern the Unpacker uses for extraction).
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, _pull)
+        while True:
+            done, _ = await asyncio.wait({future}, timeout=5.0)
+            if done:
+                try:
+                    result = await future
+                except ic.ICloudAuthError as exc:
+                    # Apple expired the trusted session. Flag the connection so the
+                    # scheduler stops firing it and the UI prompts the user to
+                    # reconnect (a fresh 2FA code) rather than failing silently.
+                    await self._mark_needs_reauth(job.icloud_connection_ref)
+                    raise ValueError(
+                        "iCloud session is no longer trusted — reconnect this iCloud "
+                        "connection in the dashboard to refresh it (a new 2FA code)."
+                    ) from exc
+                break
+            job.processed_items = progress["n"]
+            await self.save_job(job)
+
+        # Hand the pulled files to the Mapper via an iCloud manifest (its analogue
+        # of Google JSON sidecars).
+        manifest = [
+            {
+                "file_path": a.file_path,
+                "filename": a.filename,
+                "taken_at": a.taken_at_iso(),
+                "is_live_photo": a.is_live_photo,
+                "live_video_path": a.live_video_path,
+                "albums": a.albums,
+            }
+            for a in result.assets
+        ]
+        with open(os.path.join(staging_dir, "icloud_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+
+        # Advance the watermark so the next scheduled sync only pulls newer assets.
+        if result.new_watermark_ms is not None:
+            await self._save_watermark(job.icloud_connection_ref, result.new_watermark_ms)
+
+        job.extracted_dir = extracted_dir
+        job.total_items = len(result.assets)
+        job.processed_items = len(result.assets)
+        logger.info("Job %s pulled %d new iCloud assets (scanned %d)",
+                    job.id, len(result.assets), result.total_seen)
+
+    async def _mark_needs_reauth(self, connection_ref: str) -> None:
+        if not self._db_pool:
+            return
+        async with self._db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE icloud_connections SET status = 'needs_reauth' WHERE id = $1::uuid",
+                connection_ref,
+            )
+
+    async def _load_connection(self, connection_ref: str):
+        if not self._db_pool:
+            raise RuntimeError("No DB pool — cannot read iCloud connection")
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT apple_id, encrypted_password, encrypted_session, watermark_ms "
+                "FROM icloud_connections WHERE id = $1::uuid",
+                connection_ref,
+            )
+        if not row:
+            raise ValueError(f"iCloud connection {connection_ref} not found")
+        fernet = _make_fernet()
+        password = fernet.decrypt(bytes(row["encrypted_password"])).decode()
+        enc_session = row["encrypted_session"]
+        session_blob = fernet.decrypt(bytes(enc_session)) if enc_session else None
+        return row["apple_id"], password, session_blob, row["watermark_ms"]
+
+    async def _save_watermark(self, connection_ref: str, watermark_ms: int) -> None:
+        if not self._db_pool:
+            return
+        async with self._db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE icloud_connections SET watermark_ms = $1 WHERE id = $2::uuid",
+                watermark_ms, connection_ref,
+            )
+
+    # -- URL / Takeout download (unchanged) -----------------------------------
+
+    async def _handle_url(self, job: Job) -> None:
         raw_limit = await self.redis.get(MAX_TAKEOUT_BYTES_KEY)
         max_bytes = int(raw_limit) if raw_limit else DEFAULT_MAX_TAKEOUT_BYTES
 

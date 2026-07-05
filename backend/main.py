@@ -13,13 +13,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 from db import engine, Base
-from models import JobRecord
+from destinations import build_destination
+from models import JobRecord, ICloudConnection
 from redis_client import init_redis
 from routers.auth_router import router as auth_router
 from routers.admin_router import router as admin_router
 from routers.user_router import router as user_router
 from routers.jobs_router import router as jobs_router
+from routers.icloud_router import router as icloud_router
 from schemas import (
+    Job,
+    JobStatus,
+    Source,
     Stage,
     CLEANUP_HOUR_KEY,
     DEFAULT_CLEANUP_HOUR,
@@ -28,7 +33,10 @@ from schemas import (
     DEFAULT_WORKER_PCT,
     MAX_TAKEOUT_BYTES_KEY,
     STAGING_RETENTION_DAYS_KEY,
+    SYNC_SCHEDULER_TICK_SECONDS,
     job_key,
+    queue_key,
+    sync_lock_key,
     user_jobs_key,
     worker_pct_key,
 )
@@ -64,7 +72,10 @@ async def _run_cleanup(redis, staging_root: str) -> None:
             raw_job = await redis.get(job_key(record.job_id))
             if raw_job:
                 try:
-                    if json.loads(raw_job).get("date_filter"):
+                    live = json.loads(raw_job)
+                    # Date-filtered jobs (re-runnable) and the anchor of a periodic
+                    # sync are preserved past the retention window.
+                    if live.get("date_filter") or live.get("is_sync_anchor"):
                         continue
                 except Exception:
                     pass
@@ -144,6 +155,79 @@ async def _cleanup_loop(redis, staging_root: str) -> None:
             logger.exception("Staging cleanup task error")
 
 
+async def _run_sync_scheduler(redis) -> None:
+    """Enqueue an ICLOUD_DIRECT job for every connection whose sync is enabled and due.
+
+    This is the whole 'periodic sync' mechanism: recurrence lives here in the control
+    plane; the Fetcher does the incremental pull and the Loader still uploads. A
+    per-connection Redis lock plus the DB `sync_last_run_at` guard against double-firing.
+    """
+    now = datetime.now(timezone.utc)
+    async with AsyncSession(engine) as session:
+        result = await session.execute(
+            select(ICloudConnection).where(
+                ICloudConnection.sync_enabled.is_(True),
+                ICloudConnection.status == "active",
+            )
+        )
+        connections = result.scalars().all()
+
+        for conn in connections:
+            interval = timedelta(minutes=conn.sync_interval_minutes)
+            due = conn.sync_last_run_at is None or (now - conn.sync_last_run_at) >= interval
+            if not due or not conn.sync_credential_id:
+                continue
+
+            # Reserve this connection for the tick window so we never double-enqueue.
+            got_lock = await redis.set(
+                sync_lock_key(str(conn.id)), "1", nx=True, ex=SYNC_SCHEDULER_TICK_SECONDS * 2
+            )
+            if not got_lock:
+                continue
+
+            dest = await build_destination(
+                session, conn.user_id, conn.sync_credential_kind, conn.sync_credential_id
+            )
+            if dest is None:
+                logger.warning("Sync for connection %s skipped: target destination missing", conn.id)
+                continue
+
+            job = Job(
+                user_id=str(conn.user_id),
+                source=Source.ICLOUD_DIRECT,
+                stage=Stage.FETCH,
+                status=JobStatus.QUEUED,
+                takeout_url=f"icloud://{conn.id}",
+                target=dest,
+                icloud_connection_ref=str(conn.id),
+            )
+            record = JobRecord(
+                job_id=job.id,
+                user_id=conn.user_id,
+                stage=job.stage.value,
+                status=job.status.value,
+                takeout_url=job.takeout_url,
+            )
+            session.add(record)
+            conn.sync_last_run_at = now
+
+            await redis.set(job_key(job.id), job.model_dump_json())
+            await redis.zadd(user_jobs_key(str(conn.user_id)), {job.id: now.timestamp()})
+            await redis.lpush(queue_key(Stage.FETCH), job.model_dump_json())
+            logger.info("Periodic sync fired for connection %s → job %s", conn.id, job.id)
+
+        await session.commit()
+
+
+async def _sync_scheduler_loop(redis) -> None:
+    while True:
+        try:
+            await _run_sync_scheduler(redis)
+        except Exception:
+            logger.exception("Sync scheduler tick error")
+        await asyncio.sleep(SYNC_SCHEDULER_TICK_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
@@ -158,14 +242,16 @@ async def lifespan(app: FastAPI):
     await redis.set(CLEANUP_HOUR_KEY, DEFAULT_CLEANUP_HOUR, nx=True)
 
     cleanup_task = asyncio.create_task(_cleanup_loop(redis, STAGING_ROOT))
+    sync_task = asyncio.create_task(_sync_scheduler_loop(redis))
 
     yield
 
-    cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
+    for task in (cleanup_task, sync_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Photoswitch", version="0.1.0", lifespan=lifespan)
@@ -182,3 +268,4 @@ app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
 app.include_router(user_router, prefix="/api/user", tags=["user"])
 app.include_router(jobs_router, prefix="/api/jobs", tags=["jobs"])
+app.include_router(icloud_router, prefix="/api/icloud", tags=["icloud"])

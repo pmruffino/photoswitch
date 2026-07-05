@@ -6,10 +6,12 @@ import re
 import time
 from typing import Optional
 
+from datetime import datetime
+
 from base_worker import BaseWorker
 from mapper.exiftool import extract_date_from_filename, read_date, write_metadata
 from mapper.sidecar import GoogleSidecar
-from schemas import Job, MappedAsset, Stage
+from schemas import Job, MappedAsset, Source, Stage
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,13 @@ class MapperWorker(BaseWorker):
     stage = Stage.MAP
 
     async def handle(self, job: Job) -> None:
+        # iCloud *direct* pulls arrive with a manifest the Fetcher wrote (the API
+        # gave us metadata directly). iCloud *bundle* and Google both carry metadata
+        # in-file / in sidecars, so they share the file-scanning path below.
+        if job.source == Source.ICLOUD_DIRECT:
+            await self._map_from_manifest(job)
+            return
+
         extracted_dir = job.extracted_dir
         if not extracted_dir or not os.path.isdir(extracted_dir):
             raise FileNotFoundError(f"Extracted dir not found: {extracted_dir}")
@@ -120,6 +129,68 @@ class MapperWorker(BaseWorker):
             json.dump([a.model_dump(mode="json") for a in mapped], f)
 
         logger.info("Job %s mapped %d assets, wrote %s", job.id, len(mapped), output_path)
+
+    async def _map_from_manifest(self, job: Job) -> None:
+        """Map an iCloud direct pull: the Fetcher already resolved metadata into
+        icloud_manifest.json, so we stamp EXIF for date correctness and emit
+        mapped_assets.json without any sidecar/partner discovery."""
+        manifest_path = os.path.join(job.staging_dir, "icloud_manifest.json")
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(f"iCloud manifest not found: {manifest_path}")
+
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        mapped: list[MappedAsset] = []
+        job.total_items = len(entries)
+        job.processed_items = 0
+        last_save = time.monotonic()
+
+        for entry in entries:
+            media_path = entry["file_path"]
+            if not os.path.exists(media_path):
+                logger.warning("Manifest file missing on disk: %s", media_path)
+                job.processed_items += 1
+                continue
+
+            taken_at = None
+            raw_dt = entry.get("taken_at")
+            if raw_dt:
+                try:
+                    taken_at = datetime.fromisoformat(raw_dt)
+                except ValueError:
+                    taken_at = None
+            if taken_at is None:
+                taken_at = read_date(media_path)
+
+            live_video_path = entry.get("live_video_path")
+            try:
+                write_metadata(media_path, taken_at, None, None, None)
+                if live_video_path and os.path.exists(live_video_path):
+                    write_metadata(live_video_path, taken_at, None, None, None)
+            except Exception as exc:
+                logger.warning("exiftool failed on %s: %s", media_path, exc)
+
+            mapped.append(MappedAsset(
+                file_path=media_path,
+                checksum_sha1=_sha1(media_path),
+                taken_at=taken_at,
+                albums=entry.get("albums", []),
+                is_live_photo=bool(entry.get("is_live_photo")),
+                live_video_path=live_video_path,
+            ))
+            job.processed_items += 1
+
+            now = time.monotonic()
+            if now - last_save >= 5.0:
+                await self.save_job(job)
+                last_save = now
+
+        output_path = os.path.join(job.staging_dir, "mapped_assets.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump([a.model_dump(mode="json") for a in mapped], f)
+
+        logger.info("Job %s mapped %d iCloud assets, wrote %s", job.id, len(mapped), output_path)
 
 
 def _collect_files(root: str) -> set[str]:

@@ -14,10 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
 from dependencies import get_db, get_redis, get_current_user
-from models import User, ImmichCredential, JobRecord
+from destinations import resolve_destination
+from models import User, ICloudConnection, JobRecord
 from schemas import (
-    DateFilter, Job, JobStatus, Stage, ImmichTarget,
-    queue_key, job_key, user_jobs_key,
+    DateFilter, Job, JobStatus, Source, Stage,
+    queue_key, job_key, user_jobs_key, sync_lock_key,
     MAX_TAKEOUT_BYTES_KEY, DEFAULT_MAX_TAKEOUT_BYTES,
 )
 
@@ -30,6 +31,7 @@ STAGING_ROOT = os.environ.get("STAGING_ROOT", "/staging")
 class CreateJobRequest(BaseModel):
     takeout_url: str
     credential_id: str
+    destination_kind: str = "immich"
     auto_ingest: bool = True
     after_date: Optional[date] = None
     before_date: Optional[date] = None
@@ -54,6 +56,9 @@ def _merge_job(record: JobRecord, live: dict | None) -> dict:
         "updated_at": record.updated_at.isoformat(),
         "date_filter": None,
         "auto_ingest": True,
+        "source": Source.GOOGLE_TAKEOUT.value,
+        "destination_kind": "immich",
+        "is_sync_anchor": False,
     }
     if live:
         out["stage"] = live.get("stage", out["stage"])
@@ -64,6 +69,9 @@ def _merge_job(record: JobRecord, live: dict | None) -> dict:
         out["error"] = live.get("error") or out["error"]
         out["date_filter"] = live.get("date_filter")
         out["auto_ingest"] = live.get("auto_ingest", True)
+        out["source"] = live.get("source", out["source"])
+        out["destination_kind"] = (live.get("target") or {}).get("kind", out["destination_kind"])
+        out["is_sync_anchor"] = bool(live.get("is_sync_anchor", False))
     return out
 
 
@@ -74,20 +82,7 @@ async def create_job(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    try:
-        cid = uuid.UUID(body.credential_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Credential not found")
-
-    result = await db.execute(
-        select(ImmichCredential).where(
-            ImmichCredential.id == cid,
-            ImmichCredential.user_id == user.id,
-        )
-    )
-    cred = result.scalar_one_or_none()
-    if not cred:
-        raise HTTPException(status_code=404, detail="Credential not found")
+    dest = await resolve_destination(db, user, body.destination_kind, body.credential_id)
 
     date_filter: Optional[DateFilter] = None
     if body.after_date or body.before_date:
@@ -96,7 +91,7 @@ async def create_job(
     job = Job(
         user_id=str(user.id),
         takeout_url=body.takeout_url,
-        target=ImmichTarget(server_url=cred.server_url, credential_ref=str(cred.id)),
+        target=dest,
         auto_ingest=body.auto_ingest,
         date_filter=date_filter,
     )
@@ -123,9 +118,12 @@ async def create_job(
 class CreateUploadSessionRequest(BaseModel):
     filename: str
     credential_id: str
+    destination_kind: str = "immich"
     auto_ingest: bool = True
     after_date: Optional[str] = None
     before_date: Optional[str] = None
+    # "google_takeout" (default) or "icloud_bundle" for an Apple Data & Privacy export.
+    source: str = Source.GOOGLE_TAKEOUT.value
 
 
 @router.post("/upload/session", status_code=201)
@@ -135,20 +133,8 @@ async def create_upload_session(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    try:
-        cid = uuid.UUID(body.credential_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Credential not found")
-
-    result = await db.execute(
-        select(ImmichCredential).where(
-            ImmichCredential.id == cid,
-            ImmichCredential.user_id == user.id,
-        )
-    )
-    cred = result.scalar_one_or_none()
-    if not cred:
-        raise HTTPException(status_code=404, detail="Credential not found")
+    # Validates that the destination exists and is owned by the user.
+    await resolve_destination(db, user, body.destination_kind, body.credential_id)
 
     safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', body.filename)[:200] or "archive.zip"
     session_id = uuid.uuid4().hex
@@ -162,8 +148,8 @@ async def create_upload_session(
     session_data = {
         "user_id": str(user.id),
         "job_id": job_id,
-        "credential_id": str(cid),
-        "server_url": cred.server_url,
+        "credential_id": body.credential_id,
+        "destination_kind": body.destination_kind,
         "auto_ingest": body.auto_ingest,
         "after_date": body.after_date,
         "before_date": body.before_date,
@@ -171,6 +157,7 @@ async def create_upload_session(
         "staging_dir": staging_dir,
         "dest_path": dest_path,
         "bytes_received": 0,
+        "source": body.source,
     }
 
     await redis.set(f"psw:upload_session:{session_id}", json.dumps(session_data), ex=86400)
@@ -247,26 +234,24 @@ async def complete_upload_session(
     except ValueError:
         pass
 
-    try:
-        cid = uuid.UUID(session_data["credential_id"])
-    except (ValueError, KeyError):
-        raise HTTPException(status_code=400, detail="Invalid session data")
-
-    result = await db.execute(
-        select(ImmichCredential).where(
-            ImmichCredential.id == cid,
-            ImmichCredential.user_id == uuid.UUID(session_data["user_id"]),
-        )
+    dest = await resolve_destination(
+        db, user, session_data.get("destination_kind", "immich"), session_data.get("credential_id", ""),
     )
-    cred = result.scalar_one_or_none()
-    if not cred:
-        raise HTTPException(status_code=404, detail="Credential not found")
+
+    try:
+        source = Source(session_data.get("source", Source.GOOGLE_TAKEOUT.value))
+    except ValueError:
+        source = Source.GOOGLE_TAKEOUT
+    # Only archive-based sources can be uploaded; a direct iCloud pull isn't an upload.
+    if source == Source.ICLOUD_DIRECT:
+        source = Source.GOOGLE_TAKEOUT
 
     job = Job(
         id=job_id,
         user_id=session_data["user_id"],
+        source=source,
         takeout_url=f"upload://{safe_name}",
-        target=ImmichTarget(server_url=cred.server_url, credential_ref=str(cred.id)),
+        target=dest,
         auto_ingest=auto_ingest,
         date_filter=date_filter,
         staging_dir=staging_dir,
@@ -376,6 +361,21 @@ async def delete_job(
 
     if os.path.isdir(staging_dir):
         shutil.rmtree(staging_dir, ignore_errors=True)
+
+    # If this job anchors a recurring iCloud sync, deleting it tears the sync down
+    # cleanly: disable the schedule, drop the anchor pointer, and clear the lock so
+    # the scheduler can't fire for it again.
+    conn_result = await db.execute(
+        select(ICloudConnection).where(
+            ICloudConnection.anchor_job_id == job_id,
+            ICloudConnection.user_id == user.id,
+        )
+    )
+    anchored = conn_result.scalar_one_or_none()
+    if anchored:
+        anchored.sync_enabled = False
+        anchored.anchor_job_id = None
+        await redis.delete(sync_lock_key(str(anchored.id)))
 
     await db.delete(record)
     await db.commit()
