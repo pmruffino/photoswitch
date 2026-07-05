@@ -83,7 +83,7 @@ The first account registered automatically becomes the admin. All subsequent reg
 In the Dashboard, add at least one destination and use **Test** to verify it:
 
 - **Immich** — Server URL (e.g. `https://immich.example.com`) + an API key generated in Immich under *Account Settings → API Keys*.
-- **WebDAV** (Nextcloud / ownCloud / PhotoPrism) — WebDAV URL (Nextcloud/ownCloud: `…/remote.php/dav/files/<user>`), username, and password (prefer an app-password), plus an upload folder.
+- **WebDAV** (Nextcloud / ownCloud / PhotoPrism) — pick the service (the WebDAV path is auto-filled: `…/remote.php/dav/files/<user>` for Nextcloud/ownCloud, `/originals` for PhotoPrism), enter the server, username, and password (prefer an app-password), and optionally a base folder (empty = the server root).
 
 ### 5. Run an import
 
@@ -304,7 +304,7 @@ photoswitch/
     │   ├── api.ts           # Typed API client
     │   ├── contexts/auth.tsx
     │   ├── pages/           # Login, Register, Dashboard, Admin, Profile
-    │   └── components/      # Layout, ICloudSection, WebDavSection
+    │   └── components/      # Layout, DestinationsSection (Immich+WebDAV), ICloudSection
     ├── nginx.conf           # Serves SPA, proxies /api/ to backend with Docker DNS re-resolution
     └── Dockerfile
 ```

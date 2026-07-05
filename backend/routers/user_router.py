@@ -298,11 +298,15 @@ async def test_immich(
 # WebDAV destinations (Nextcloud / ownCloud / PhotoPrism / any WebDAV server)
 # ---------------------------------------------------------------------------
 
+_WEBDAV_SERVICES = {"nextcloud", "owncloud", "photoprism", "other"}
+
+
 class AddWebDavRequest(BaseModel):
     base_url: str
     username: str
     password: str
-    base_path: str = "Photoswitch"
+    base_path: str = ""   # optional base folder under the WebDAV root; empty = root
+    service: str = "other"
     label: str | None = None
 
 
@@ -311,6 +315,7 @@ class UpdateWebDavRequest(BaseModel):
     username: str | None = None
     password: str | None = None
     base_path: str | None = None
+    service: str | None = None
     label: str | None = None
 
 
@@ -320,6 +325,7 @@ def _webdav_out(d: WebDavDestination) -> dict:
         "base_url": d.base_url,
         "username": d.username,
         "base_path": d.base_path,
+        "service": d.service,
         "label": d.label,
         "created_at": d.created_at.isoformat(),
     }
@@ -366,7 +372,8 @@ async def add_webdav(
         base_url=body.base_url.rstrip("/"),
         username=body.username,
         encrypted_password=encrypt(body.password),
-        base_path=(body.base_path or "Photoswitch").strip("/") or "Photoswitch",
+        base_path=(body.base_path or "").strip("/"),
+        service=body.service if body.service in _WEBDAV_SERVICES else "other",
         label=body.label or None,
     )
     db.add(dest)
@@ -392,7 +399,9 @@ async def update_webdav(
     if body.password:
         dest.encrypted_password = encrypt(body.password)
     if body.base_path is not None:
-        dest.base_path = body.base_path.strip("/") or "Photoswitch"
+        dest.base_path = body.base_path.strip("/")
+    if body.service is not None and body.service in _WEBDAV_SERVICES:
+        dest.service = body.service
     if body.label is not None:
         dest.label = body.label or None
     await db.commit()

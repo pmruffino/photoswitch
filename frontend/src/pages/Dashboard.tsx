@@ -1,8 +1,8 @@
 import { Fragment, FormEvent, useCallback, useEffect, useState } from 'react'
 import Layout from '../components/Layout'
 import ICloudSection from '../components/ICloudSection'
-import WebDavSection from '../components/WebDavSection'
-import { api, ImmichCred, WebDavDest, Job, toDestOptions, uploadJobChunked } from '../api'
+import DestinationsSection from '../components/DestinationsSection'
+import { api, DestOption, Job, uploadJobChunked } from '../api'
 
 function stageProgress(job: Job): string {
   if (job.stage === 'fetch') return '—'
@@ -46,7 +46,6 @@ function destinationLabel(job: Job): string {
 
 const INPUT = 'w-full border border-slate-300 dark:border-zinc-600 rounded-md px-3 py-2 text-sm bg-white dark:bg-zinc-800 text-slate-900 dark:text-zinc-100 placeholder-slate-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-500'
 const BTN_PRIMARY = 'bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50'
-const BTN_SECONDARY = 'bg-white dark:bg-zinc-800 border border-slate-300 dark:border-zinc-600 text-slate-700 dark:text-zinc-300 px-4 py-2 rounded-md text-sm hover:bg-slate-50 dark:hover:bg-zinc-700'
 
 function Badge({ text, color }: { text: string; color: string }) {
   return (
@@ -57,33 +56,10 @@ function Badge({ text, color }: { text: string; color: string }) {
 }
 
 export default function Dashboard() {
-  const [creds, setCreds] = useState<ImmichCred[]>([])
-  const [webdavs, setWebdavs] = useState<WebDavDest[]>([])
-  const destOptions = toDestOptions(creds, webdavs)
+  // Destination options (Immich + WebDAV) reported up by DestinationsSection.
+  const [destOptions, setDestOptions] = useState<DestOption[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
-  const [showAddCred, setShowAddCred] = useState(false)
   const [showNewJob, setShowNewJob] = useState(false)
-
-  // Add connection form
-  const [credUrl, setCredUrl] = useState('')
-  const [credKey, setCredKey] = useState('')
-  const [credLabel, setCredLabel] = useState('')
-  const [credKeyVisible, setCredKeyVisible] = useState(false)
-  const [credError, setCredError] = useState('')
-  const [credLoading, setCredLoading] = useState(false)
-
-  // Edit connection form
-  const [editCredId, setEditCredId] = useState<string | null>(null)
-  const [editUrl, setEditUrl] = useState('')
-  const [editLabel, setEditLabel] = useState('')
-  const [editKey, setEditKey] = useState('')
-  const [editKeyVisible, setEditKeyVisible] = useState(false)
-  const [editError, setEditError] = useState('')
-  const [editLoading, setEditLoading] = useState(false)
-
-  // Connection test state
-  const [testingCredId, setTestingCredId] = useState<string | null>(null)
-  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; detail?: string }>>({})
 
   // New bundle form. jobDest holds a combined "kind:id" destination key.
   const [jobUrl, setJobUrl] = useState('')
@@ -117,10 +93,7 @@ export default function Dashboard() {
     try { setJobs(await api.jobs.list()) } catch {}
   }, [])
 
-  useEffect(() => {
-    api.user.listImmich().then(setCreds).catch(() => {})
-    fetchJobs()
-  }, [fetchJobs])
+  useEffect(() => { fetchJobs() }, [fetchJobs])
 
   useEffect(() => {
     if (destOptions.length > 0 && !jobDest) {
@@ -135,76 +108,6 @@ export default function Dashboard() {
     const id = setInterval(fetchJobs, 5000)
     return () => clearInterval(id)
   }, [hasActiveJobs, fetchJobs])
-
-  async function addCred(e: FormEvent) {
-    e.preventDefault()
-    setCredError('')
-    setCredLoading(true)
-    try {
-      const c = await api.user.addImmich({ server_url: credUrl, api_key: credKey, label: credLabel || undefined })
-      setCreds(prev => [...prev, c])
-      setShowAddCred(false)
-      setCredUrl(''); setCredKey(''); setCredLabel('')
-    } catch (err) {
-      setCredError(err instanceof Error ? err.message : 'Failed to save')
-    } finally {
-      setCredLoading(false)
-    }
-  }
-
-  function startEdit(c: ImmichCred) {
-    setShowAddCred(false)
-    setEditCredId(c.id)
-    setEditUrl(c.server_url)
-    setEditLabel(c.label ?? '')
-    setEditKey('')
-    setEditKeyVisible(false)
-    setEditError('')
-  }
-
-  function cancelEdit() {
-    setEditCredId(null)
-    setEditUrl(''); setEditLabel(''); setEditKey('')
-  }
-
-  async function updateCred(e: FormEvent) {
-    e.preventDefault()
-    if (!editCredId) return
-    setEditError('')
-    setEditLoading(true)
-    try {
-      const updated = await api.user.updateImmich(editCredId, {
-        server_url: editUrl || undefined,
-        label: editLabel || undefined,
-        api_key: editKey || undefined,
-      })
-      setCreds(prev => prev.map(c => c.id === editCredId ? updated : c))
-      cancelEdit()
-    } catch (err) {
-      setEditError(err instanceof Error ? err.message : 'Failed to update')
-    } finally {
-      setEditLoading(false)
-    }
-  }
-
-  async function testCred(id: string) {
-    setTestingCredId(id)
-    try {
-      const result = await api.user.testImmich(id)
-      setTestResults(prev => ({ ...prev, [id]: { ok: true, detail: result.user } }))
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Connection failed'
-      setTestResults(prev => ({ ...prev, [id]: { ok: false, detail: msg } }))
-    } finally {
-      setTestingCredId(null)
-    }
-  }
-
-  async function deleteCred(id: string) {
-    if (!confirm('Delete this Immich connection?')) return
-    await api.user.deleteImmich(id).catch(() => {})
-    setCreds(prev => prev.filter(c => c.id !== id))
-  }
 
   async function createJob(e: FormEvent) {
     e.preventDefault()
@@ -354,140 +257,12 @@ export default function Dashboard() {
 
   return (
     <Layout>
-      {/* Immich Connections */}
-      <section className="mb-10">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-slate-900 dark:text-zinc-100">Immich Connections</h2>
-          <button
-            onClick={() => { setShowAddCred(v => !v); cancelEdit() }}
-            className={BTN_PRIMARY}
-          >
-            {showAddCred ? 'Cancel' : 'Add connection'}
-          </button>
-        </div>
+      {/* Image Destinations */}
+      <DestinationsSection onDestinationsChange={setDestOptions} />
 
-        {showAddCred && (
-          <form onSubmit={addCred} className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg p-5 mb-4 space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 dark:text-zinc-300 mb-1">Server URL</label>
-                <input type="url" value={credUrl} onChange={e => setCredUrl(e.target.value)} required placeholder="https://immich.example.com" className={INPUT} />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 dark:text-zinc-300 mb-1">Label (optional)</label>
-                <input type="text" value={credLabel} onChange={e => setCredLabel(e.target.value)} placeholder="My Immich server" className={INPUT} />
-              </div>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-zinc-300 mb-1">API Key</label>
-              <div className="relative">
-                <input
-                  type={credKeyVisible ? 'text' : 'password'}
-                  value={credKey}
-                  onChange={e => setCredKey(e.target.value)}
-                  required
-                  placeholder="Paste your Immich API key"
-                  className={INPUT + ' pr-16'}
-                />
-                <button type="button" onClick={() => setCredKeyVisible(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200">
-                  {credKeyVisible ? 'Hide' : 'Show'}
-                </button>
-              </div>
-              <div className="mt-2 bg-slate-50 dark:bg-zinc-800/60 border border-slate-200 dark:border-zinc-700 rounded-md px-3 py-2.5 space-y-1">
-                <p className="text-xs font-medium text-slate-700 dark:text-zinc-200">How to generate an API key in Immich:</p>
-                <ol className="text-xs text-slate-600 dark:text-zinc-300 space-y-0.5 list-decimal list-inside">
-                  <li>Open your Immich server in a browser and sign in</li>
-                  <li>Click your profile photo → <strong>Account Settings</strong></li>
-                  <li>Scroll to the <strong>API Keys</strong> section and click <strong>New API Key</strong></li>
-                  <li>Give it a name (e.g. "Photoswitch"), then click <strong>Create</strong></li>
-                  <li>Copy the key immediately — it is only shown once</li>
-                </ol>
-              </div>
-            </div>
-            {credError && <p className="text-sm text-red-600 dark:text-red-400">{credError}</p>}
-            <button type="submit" disabled={credLoading} className={BTN_PRIMARY}>{credLoading ? 'Saving…' : 'Save connection'}</button>
-          </form>
-        )}
-
-        {creds.length === 0 && !showAddCred ? (
-          <p className="text-sm text-slate-500 dark:text-zinc-400">No Immich connections saved yet.</p>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {creds.map(c => {
-              if (editCredId === c.id) {
-                return (
-                  <div key={c.id} className="col-span-full bg-white dark:bg-zinc-900 border border-red-300 dark:border-red-800 rounded-lg p-5 space-y-3">
-                    <p className="text-sm font-semibold text-slate-800 dark:text-zinc-100">Edit connection</p>
-                    <form onSubmit={updateCred} className="space-y-3">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-medium text-slate-700 dark:text-zinc-300 mb-1">Server URL</label>
-                          <input type="url" value={editUrl} onChange={e => setEditUrl(e.target.value)} required className={INPUT} />
-                        </div>
-                        <div>
-                          <label className="block text-xs font-medium text-slate-700 dark:text-zinc-300 mb-1">Label (optional)</label>
-                          <input type="text" value={editLabel} onChange={e => setEditLabel(e.target.value)} placeholder="My Immich server" className={INPUT} />
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-slate-700 dark:text-zinc-300 mb-1">
-                          New API Key <span className="font-normal text-slate-400 dark:text-zinc-500">(leave blank to keep existing)</span>
-                        </label>
-                        <div className="relative">
-                          <input type={editKeyVisible ? 'text' : 'password'} value={editKey} onChange={e => setEditKey(e.target.value)} placeholder="Enter new key to replace" className={INPUT + ' pr-16'} />
-                          <button type="button" onClick={() => setEditKeyVisible(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200">
-                            {editKeyVisible ? 'Hide' : 'Show'}
-                          </button>
-                        </div>
-                      </div>
-                      {editError && <p className="text-sm text-red-600 dark:text-red-400">{editError}</p>}
-                      <div className="flex gap-2">
-                        <button type="submit" disabled={editLoading} className={BTN_PRIMARY}>{editLoading ? 'Saving…' : 'Save changes'}</button>
-                        <button type="button" onClick={cancelEdit} className={BTN_SECONDARY}>Cancel</button>
-                      </div>
-                    </form>
-                  </div>
-                )
-              }
-
-              const testResult = testResults[c.id]
-              const isTesting = testingCredId === c.id
-
-              return (
-                <div key={c.id} className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg p-4 flex flex-col gap-1">
-                  <p className="text-sm font-medium text-slate-900 dark:text-zinc-100 truncate">{c.label ?? c.server_url}</p>
-                  {c.label && <p className="text-xs text-slate-500 dark:text-zinc-400 truncate">{c.server_url}</p>}
-                  <p className="text-xs text-slate-400 dark:text-zinc-500 mt-1">{new Date(c.created_at).toLocaleDateString()}</p>
-                  {testResult && (
-                    <p className={`text-xs mt-1 ${testResult.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500 dark:text-red-400'}`}>
-                      {testResult.ok ? `Connected${testResult.detail ? ` as ${testResult.detail}` : ''}` : testResult.detail}
-                    </p>
-                  )}
-                  <div className="flex items-center gap-3 mt-2 pt-2 border-t border-slate-100 dark:border-zinc-700">
-                    <button
-                      onClick={() => testCred(c.id)}
-                      disabled={isTesting || testingCredId !== null}
-                      className="flex items-center gap-1 text-xs text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200 disabled:opacity-50"
-                    >
-                      {isTesting && <span className="inline-block w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />}
-                      {isTesting ? 'Testing…' : 'Test'}
-                    </button>
-                    <button onClick={() => startEdit(c)} className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-zinc-100">
-                      Modify
-                    </button>
-                    <button onClick={() => deleteCred(c.id)} className="text-xs text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300">
-                      Remove
-                    </button>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )}
-      </section>
-
-      {/* WebDAV Destinations */}
-      <WebDavSection onDestsChange={setWebdavs} />
+      {/* Image Sources */}
+      <h2 className="text-xl font-bold text-slate-900 dark:text-zinc-100 mb-1">Image Sources</h2>
+      <p className="text-xs text-slate-500 dark:text-zinc-400 mb-5">Where your photos are imported from — Apple iCloud or Google Photos.</p>
 
       {/* Apple iCloud */}
       <ICloudSection destinations={destOptions} onJobCreated={fetchJobs} />

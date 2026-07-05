@@ -21,6 +21,7 @@ export interface WebDavDest {
   base_url: string
   username: string
   base_path: string
+  service: 'nextcloud' | 'owncloud' | 'photoprism' | 'other'
   label: string | null
   created_at: string
 }
@@ -32,10 +33,14 @@ export interface DestOption {
   label: string
 }
 
+export function webdavServiceLabel(service: string): string {
+  return { nextcloud: 'Nextcloud', owncloud: 'ownCloud', photoprism: 'PhotoPrism' }[service] ?? 'WebDAV-Other'
+}
+
 export function toDestOptions(immich: ImmichCred[], webdav: WebDavDest[]): DestOption[] {
   return [
     ...immich.map(c => ({ kind: 'immich' as const, id: c.id, label: `${c.label ?? c.server_url} (Immich)` })),
-    ...webdav.map(d => ({ kind: 'webdav' as const, id: d.id, label: `${d.label ?? d.base_url} (WebDAV)` })),
+    ...webdav.map(d => ({ kind: 'webdav' as const, id: d.id, label: `${d.label ?? d.base_url} (${webdavServiceLabel(d.service)})` })),
   ]
 }
 
@@ -184,9 +189,9 @@ export const api = {
     deleteImmich: (id: string) => req<void>('DELETE', `/user/immich/${id}`),
     testImmich: (id: string) => req<{ ok: boolean; user?: string }>('POST', `/user/immich/${id}/test`),
     listWebdav: () => req<WebDavDest[]>('GET', '/user/webdav'),
-    addWebdav: (data: { base_url: string; username: string; password: string; base_path?: string; label?: string }) =>
+    addWebdav: (data: { base_url: string; username: string; password: string; base_path?: string; service?: string; label?: string }) =>
       req<WebDavDest>('POST', '/user/webdav', data),
-    updateWebdav: (id: string, data: { base_url?: string; username?: string; password?: string; base_path?: string; label?: string }) =>
+    updateWebdav: (id: string, data: { base_url?: string; username?: string; password?: string; base_path?: string; service?: string; label?: string }) =>
       req<WebDavDest>('PATCH', `/user/webdav/${id}`, data),
     deleteWebdav: (id: string) => req<void>('DELETE', `/user/webdav/${id}`),
     testWebdav: (id: string) => req<{ ok: boolean; user?: string }>('POST', `/user/webdav/${id}/test`),

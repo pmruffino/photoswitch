@@ -69,7 +69,10 @@ class WebDavDestination(Base):
     base_url: Mapped[str] = mapped_column(String(512), nullable=False)
     username: Mapped[str] = mapped_column(String(256), nullable=False)
     encrypted_password: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    base_path: Mapped[str] = mapped_column(String(512), default="Photoswitch", nullable=False)
+    # Optional base folder under the WebDAV root; empty = upload to the root itself.
+    base_path: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    # nextcloud | owncloud | photoprism | other — used by the add form (path template) + UI badge.
+    service: Mapped[str] = mapped_column(String(24), default="other", nullable=False)
     label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 

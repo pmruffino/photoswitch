@@ -38,7 +38,7 @@ def _safe_seg(name: str) -> str:
 
 
 class WebDavClient:
-    def __init__(self, base_url: str, username: str, password: str, base_path: str = "Photoswitch"):
+    def __init__(self, base_url: str, username: str, password: str, base_path: str = ""):
         self.base_url = base_url.rstrip("/")
         self.base_path = base_path.strip("/")
         self._client = httpx.AsyncClient(
@@ -62,6 +62,13 @@ class WebDavClient:
         return "/".join(parts)
 
     def _album_dir(self, album: str | None) -> list[str]:
+        # Layout, relative to the WebDAV URL's root (the user's files root for
+        # Nextcloud/ownCloud; the `originals` folder for PhotoPrism):
+        #   album "A"  -> {base_path}/A/   (or A/ when base_path is empty)
+        #   no album   -> {base_path}/     (or the root itself when base_path is empty)
+        # base_path is optional (default empty = upload to the root). This is uniform
+        # across services: PhotoPrism albums are virtual and can't be targeted over
+        # WebDAV anyway, so a folder under `originals` is the closest analogue.
         base = [self.base_path] if self.base_path else []
         return base + ([_safe_seg(album)] if album else [])
 

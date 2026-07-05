@@ -12,9 +12,11 @@ the single source of truth for architecture and locked decisions.
 **Status:** All pipeline stages are implemented. Sources: Google Takeout (link or
 upload), Apple iCloud (direct connection + Apple Data & Privacy export bundle).
 Destinations: Immich and WebDAV (Nextcloud / ownCloud / PhotoPrism). Periodic iCloud
-sync is implemented via the backend scheduler. The Apple iCloud UI lives in
-`frontend/src/components/ICloudSection.tsx`; WebDAV destinations in
-`frontend/src/components/WebDavSection.tsx`.
+sync is implemented via the backend scheduler. The dashboard is split into two
+sections: **Image Destinations** (`frontend/src/components/DestinationsSection.tsx` —
+a unified Immich + WebDAV list with an "Add destination" type picker: Immich,
+Nextcloud, ownCloud, PhotoPrism, WebDAV-Other) and **Image Sources** (Apple iCloud via
+`ICloudSection.tsx`, plus Google Takeout), followed by the **Imports** job table.
 
 **Not yet verified against live third-party services:** the iCloud direct-connection
 auth/2FA + photo pull (built against mainline `pyicloud` v2.6.5, API surface
@@ -236,14 +238,28 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   - **`immich`** — the original path (see Immich connection below).
   - **`webdav`** — covers **Nextcloud, ownCloud, and PhotoPrism** (and any WebDAV
     server) through one implementation. Credentials live in `webdav_destinations`
-    (base URL, username, encrypted password/app-password, base upload folder). The
-    Loader (`workers/webdav.py`) uploads the mapped files by `PUT` into folders;
-    because the Mapper already bakes timestamp/GPS/description into each file's
-    EXIF/QuickTime, that metadata travels with the upload and Nextcloud
-    Memories/PhotoPrism index it — no destination-side metadata API needed.
-    - **Albums are folder-based (v1):** an album named `A` becomes the folder
-      `{base}/A/`; un-albumed photos go in `{base}/`. Native Nextcloud album APIs are
-      deliberately out of scope for v1.
+    (base URL, username, encrypted password/app-password, optional base folder — empty
+    = the WebDAV root, and a
+    `service` tag: `nextcloud` | `owncloud` | `photoprism` | `other`). The add form
+    splits the **server** (`https://host`) from the **WebDAV path**; the path is
+    auto-derived per service (`/remote.php/dav/files/<username>` for Nextcloud/ownCloud,
+    `/originals` for PhotoPrism, editable free-text for `other`) and re-substitutes the
+    username live for the fixed services. The Loader (`workers/webdav.py`) uploads the
+    mapped files by `PUT` into folders; because the Mapper already bakes
+    timestamp/GPS/description into each file's EXIF/QuickTime, that metadata travels
+    with the upload and Nextcloud Memories/PhotoPrism index it — no destination-side
+    metadata API needed.
+    - **Albums are folder-based (v1)** and the layout is **uniform across services**,
+      relative to the WebDAV URL's root (the user's files root for Nextcloud/ownCloud;
+      the `originals` folder for PhotoPrism). The **base folder is optional and defaults
+      to empty = the root**: album `A` → `{base_path}/A/` (or `A/` at the root when
+      base_path is empty); un-albumed photos → `{base_path}/` (or the root itself).
+    - **PhotoPrism specifics (verified against its docs):** WebDAV is mounted only at
+      `/originals/` (and `/import/`), so the URL must contain `originals`. **PhotoPrism
+      albums are virtual — there is no WebDAV path for them**, so what we write are
+      plain *folders* under `originals` (PhotoPrism lists them under “Folders” and
+      auto-indexes them); they are not true PhotoPrism albums. Native
+      Nextcloud/PhotoPrism album *APIs* are out of scope for v1.
     - **A photo in multiple albums is uploaded once.** The bytes are `PUT` a single
       time to the first album's folder; membership in every other album is a
       **server-side WebDAV `COPY`** (no client re-upload). Folder albums do duplicate
