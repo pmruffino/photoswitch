@@ -147,6 +147,49 @@ def complete_2fa(service, code: str) -> None:
         service.trust_session()
 
 
+def request_sms_code(service) -> Optional[str]:
+    """Ask Apple to send the 2FA code to the account's trusted phone number by SMS.
+
+    This is the "text me a code instead" fallback for when the user can't retrieve the
+    code from a trusted Apple device — the same "Didn't get a verification code?" route
+    Apple offers on its web sign-in. pyicloud 2.6.5's `validate_2fa_code()` already
+    routes to the SMS verifier once the delivery state is 'sms' (which the SMS request
+    sets), so `complete_2fa()` needs no change to accept the texted code.
+
+    Returns a masked phone-number hint (e.g. Apple's obfuscated "•••• 12") when Apple
+    provides one, else None. Raises ICloudAuthError if no trusted phone number exists.
+    """
+    sms = getattr(service, "_request_sms_2fa_code", None)
+    try:
+        if callable(sms):
+            # Explicit SMS path; sets delivery state to 'sms' so validation routes right.
+            sms()
+        else:
+            # Fallback: trigger whatever delivery route Apple has active.
+            service.request_2fa_code()
+    except Exception as exc:  # pyicloud raises PyiCloudNoTrustedNumberAvailable, etc.
+        raise ICloudAuthError(
+            f"Apple would not send an SMS code — the account may have no trusted "
+            f"phone number, or SMS delivery is unavailable ({exc})."
+        ) from exc
+    return _masked_trusted_phone(service)
+
+
+def _masked_trusted_phone(service) -> Optional[str]:
+    """Best-effort masked trusted-phone string pulled from the in-flight auth data."""
+    try:
+        raw = getattr(service, "_auth_data", {}) or {}
+        tp = raw.get("trustedPhoneNumber")
+        if isinstance(tp, dict):
+            for key in ("numberWithDialCode", "obfuscatedNumber", "number", "lastTwoDigits"):
+                val = tp.get(key)
+                if val:
+                    return str(val)
+    except Exception:
+        pass
+    return None
+
+
 def open_session(apple_id: str, password: str, cookie_dir: str):
     """Worker-side: open a service from an already-trusted cookie dir.
 

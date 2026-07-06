@@ -202,6 +202,8 @@ export const api = {
       req<ICloudConnection>('POST', '/icloud/connections', data),
     verifyConnection: (id: string, code: string) =>
       req<ICloudConnection>('POST', `/icloud/connections/${id}/verify`, { code }),
+    sendSmsCode: (id: string) =>
+      req<{ sent: boolean; phone: string | null }>('POST', `/icloud/connections/${id}/send-sms`),
     testConnection: (id: string) =>
       req<{ ok: boolean; user?: string }>('POST', `/icloud/connections/${id}/test`),
     deleteConnection: (id: string) => req<void>('DELETE', `/icloud/connections/${id}`),

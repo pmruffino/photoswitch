@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -228,10 +228,32 @@ async def _sync_scheduler_loop(redis) -> None:
         await asyncio.sleep(SYNC_SCHEDULER_TICK_SECONDS)
 
 
+# Idempotent, additive schema patches for DBs created by an earlier version.
+# `create_all` only creates missing *tables*; it never adds columns to a table that
+# already exists. Anyone upgrading a running stack (persistent Postgres volume) keeps
+# the old table, so new columns must be added explicitly. Each statement is safe to
+# run every startup (`ADD COLUMN IF NOT EXISTS`) and no-ops once applied.
+_SCHEMA_PATCHES = [
+    # `service` (nextcloud|owncloud|photoprism|other) added after v1.2.0-icloud.
+    "ALTER TABLE webdav_destinations ADD COLUMN IF NOT EXISTS service VARCHAR(24) NOT NULL DEFAULT 'other'",
+    # `base_path` default relaxed from 'Photoswitch' to '' (root); ensure the column exists.
+    "ALTER TABLE webdav_destinations ADD COLUMN IF NOT EXISTS base_path VARCHAR(512) NOT NULL DEFAULT ''",
+]
+
+
+async def _apply_schema_patches(conn):
+    for stmt in _SCHEMA_PATCHES:
+        try:
+            await conn.execute(text(stmt))
+        except Exception:
+            logger.exception("Schema patch failed (continuing): %s", stmt)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _apply_schema_patches(conn)
 
     redis = await init_redis()
     for stage in Stage:

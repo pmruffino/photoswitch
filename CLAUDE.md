@@ -187,7 +187,12 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
     Photos, so the mainline `pyicloud` library is used, borrowing icloudpd's session
     and incremental-pull patterns). Connect is a
     two-step flow: `POST /api/icloud/connections` starts auth; `POST
-    /connections/{id}/verify` submits the 6-digit code. The resulting **trusted
+    /connections/{id}/verify` submits the 6-digit code. Apple pushes the code to
+    trusted devices by default; if the user can't get it there, `POST
+    /connections/{id}/send-sms` asks Apple to text it to the account's trusted phone
+    number instead (`icloud_client.request_sms_code` → pyicloud `_request_sms_2fa_code`,
+    which flips delivery state to `sms` so the same `/verify` → `validate_2fa_code`
+    routes the texted code to the SMS verifier). The resulting **trusted
     session** (a packed pyicloud cookie directory) and the Apple password are stored
     encrypted at rest on the `icloud_connections` row, reusing the same Fernet key as
     Immich credentials, so subsequent pulls skip 2FA. Apple expires trust ~every 2
@@ -316,6 +321,15 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
     Apple ID, encrypted password, encrypted trusted session, status, sync-watermark,
     sync schedule + target), job history (`job_records` table).
   - **Redis** — queues, semaphores, live config, sessions, live job state.
+- **Schema patches (no Alembic):** the backend creates tables with
+  `Base.metadata.create_all` on startup, which only creates *missing tables* — it never
+  adds a column to a table that already exists. Because deployments keep a persistent
+  Postgres volume, columns added to an existing table (e.g. `webdav_destinations.service`,
+  added after v1.2.0-icloud) must be applied explicitly. `_apply_schema_patches` in
+  `main.py` runs a short list of idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+  statements right after `create_all`; each is safe to run every startup and no-ops once
+  applied. New non-nullable columns on existing tables must be added here (with a
+  `DEFAULT`), not just on the model.
 - **Live job state:** canonical job state lives in Redis (`psw:job:{id}`). Postgres
   `job_records` is updated at stage transitions for durable history. The dashboard
   reads from Redis for live progress.

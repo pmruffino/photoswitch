@@ -171,6 +171,34 @@ async def verify_connection(
     return _conn_out(conn)
 
 
+@router.post("/connections/{connection_id}/send-sms")
+async def send_sms_code(
+    connection_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Ask Apple to (re)send the 2FA code by SMS to the account's trusted phone number
+    — the "text me a code instead" fallback during the two-step connect flow. Requires
+    a still-pending authentication (i.e. start the connection first). The texted code is
+    submitted through the normal /verify endpoint; pyicloud routes it to the SMS verifier
+    automatically."""
+    await _get_connection(db, user, connection_id)  # ownership / existence check
+    cookie_dir = _auth_cookie_dir(connection_id)
+    service = _PENDING_AUTH.get(cookie_dir)
+    if service is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No pending authentication for this connection — start the connection again",
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        phone = await loop.run_in_executor(None, ic.request_sms_code, service)
+    except ic.ICloudAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"sent": True, "phone": phone}
+
+
 async def _persist_session(db: AsyncSession, conn: ICloudConnection, cookie_dir: str) -> None:
     """Pack + encrypt the trusted cookie dir onto the connection row, mark active."""
     blob = ic.serialize_session(cookie_dir)

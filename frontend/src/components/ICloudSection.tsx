@@ -54,6 +54,9 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
   const [code, setCode] = useState('')
   const [verifyError, setVerifyError] = useState('')
   const [verifyLoading, setVerifyLoading] = useState(false)
+  // "Text me a code instead" fallback
+  const [smsSending, setSmsSending] = useState(false)
+  const [smsNotice, setSmsNotice] = useState('')
 
   // Per-connection expandable panel
   const [panel, setPanel] = useState<{ id: string; kind: 'import' | 'sync' } | null>(null)
@@ -122,11 +125,26 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
     try {
       const c = await api.icloud.verifyConnection(pendingId, code.trim())
       setConns(prev => prev.map(p => p.id === c.id ? c : p))
-      setPendingId(null); setCode(''); setAppleId(''); setLabel('')
+      setPendingId(null); setCode(''); setAppleId(''); setLabel(''); setSmsNotice('')
     } catch (err) {
       setVerifyError(err instanceof Error ? err.message : 'Verification failed')
     } finally {
       setVerifyLoading(false)
+    }
+  }
+
+  async function sendSms() {
+    if (!pendingId) return
+    setSmsNotice(''); setVerifyError(''); setSmsSending(true)
+    try {
+      const r = await api.icloud.sendSmsCode(pendingId)
+      setSmsNotice(r.phone
+        ? `Text message sent to ${r.phone}. Enter that code above.`
+        : 'Text message sent to your trusted phone number. Enter that code above.')
+    } catch (err) {
+      setVerifyError(err instanceof Error ? err.message : 'Could not send a text message')
+    } finally {
+      setSmsSending(false)
     }
   }
 
@@ -176,7 +194,7 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
           <div className="bg-slate-50 dark:bg-zinc-800/60 border border-slate-200 dark:border-zinc-700 rounded-md px-3 py-2.5 space-y-1">
             <p className="text-xs font-medium text-slate-700 dark:text-zinc-200">What happens next:</p>
             <ol className="text-xs text-slate-600 dark:text-zinc-300 space-y-0.5 list-decimal list-inside">
-              <li>Apple sends a 6-digit code to your trusted devices</li>
+              <li>Apple sends a 6-digit code to your trusted devices (or request a text message instead)</li>
               <li>Enter that code here to establish a trusted session</li>
               <li>The session is stored encrypted and reused — Apple re-prompts for a code roughly every two months</li>
             </ol>
@@ -263,13 +281,23 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
               {pendingId === c.id && (
                 <form onSubmit={verify} className="mt-3 pt-3 border-t border-slate-100 dark:border-zinc-700 flex flex-wrap items-end gap-3">
                   <div>
-                    <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">6-digit code from your Apple device</label>
+                    <label className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">6-digit verification code</label>
                     <input value={code} onChange={e => setCode(e.target.value)} required inputMode="numeric" placeholder="123456"
                       className="border border-slate-300 dark:border-zinc-600 rounded-md px-3 py-1.5 text-sm bg-white dark:bg-zinc-800 text-slate-900 dark:text-zinc-100 tracking-widest w-32 focus:outline-none focus:ring-2 focus:ring-red-500" />
                   </div>
                   <button type="submit" disabled={verifyLoading} className={BTN_PRIMARY}>{verifyLoading ? 'Verifying…' : 'Verify'}</button>
-                  <button type="button" onClick={() => { setPendingId(null); setCode('') }} className={BTN_SECONDARY}>Cancel</button>
-                  {verifyError && <p className="w-full text-sm text-red-600 dark:text-red-400">{verifyError}</p>}
+                  <button type="button" onClick={() => { setPendingId(null); setCode(''); setSmsNotice('') }} className={BTN_SECONDARY}>Cancel</button>
+                  <div className="w-full flex flex-col gap-1">
+                    <p className="text-xs text-slate-500 dark:text-zinc-400">
+                      The code is pushed to your trusted Apple devices. Didn't get it?{' '}
+                      <button type="button" onClick={sendSms} disabled={smsSending}
+                        className="underline text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 disabled:opacity-50">
+                        {smsSending ? 'Sending text…' : 'Text me a code instead'}
+                      </button>
+                    </p>
+                    {smsNotice && <p className="text-xs text-green-600 dark:text-green-400">{smsNotice}</p>}
+                    {verifyError && <p className="text-sm text-red-600 dark:text-red-400">{verifyError}</p>}
+                  </div>
                 </form>
               )}
 
