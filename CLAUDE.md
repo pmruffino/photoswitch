@@ -192,7 +192,12 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
     /connections/{id}/send-sms` asks Apple to text it to the account's trusted phone
     number instead (`icloud_client.request_sms_code` → pyicloud `_request_sms_2fa_code`,
     which flips delivery state to `sms` so the same `/verify` → `validate_2fa_code`
-    routes the texted code to the SMS verifier). If a connect is interrupted before
+    routes the texted code to the SMS verifier). Because the initial challenge is
+    bootstrapped from Apple's HTML auth shell (trusted-device oriented, no phone
+    numbers), `request_sms_code` first re-fetches the auth endpoint as JSON (Apple's
+    SMS-oriented shape) and merges the `trustedPhoneNumbers` into the pending service's
+    auth data — otherwise the SMS request fails with "no trusted number" even on
+    accounts that have one. If a connect is interrupted before
     2FA finishes (or the single-instance backend restarts and loses the in-memory
     `_PENDING_AUTH` hold), the connection is left at `status=pending_2fa`; `POST
     /connections/{id}/restart` re-begins auth on that same row (re-storing the possibly

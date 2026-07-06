@@ -159,6 +159,12 @@ def request_sms_code(service) -> Optional[str]:
     Returns a masked phone-number hint (e.g. Apple's obfuscated "•••• 12") when Apple
     provides one, else None. Raises ICloudAuthError if no trusted phone number exists.
     """
+    # The initial 2FA challenge populates the service's auth data from Apple's HTML auth
+    # shell, which is trusted-device oriented and usually omits phone numbers — so a bare
+    # _request_sms_2fa_code() raises "no trusted number" even when the account has one.
+    # Enrich the auth data with Apple's SMS-oriented (JSON) auth options first.
+    _ensure_trusted_phone(service)
+
     sms = getattr(service, "_request_sms_2fa_code", None)
     try:
         if callable(sms):
@@ -168,23 +174,92 @@ def request_sms_code(service) -> Optional[str]:
             # Fallback: trigger whatever delivery route Apple has active.
             service.request_2fa_code()
     except Exception as exc:  # pyicloud raises PyiCloudNoTrustedNumberAvailable, etc.
+        detail = str(exc) or exc.__class__.__name__
         raise ICloudAuthError(
-            f"Apple would not send an SMS code — the account may have no trusted "
-            f"phone number, or SMS delivery is unavailable ({exc})."
+            f"Apple would not send an SMS code ({detail}). The account may have no trusted "
+            f"phone number available for this sign-in, or SMS delivery is unavailable."
         ) from exc
     return _masked_trusted_phone(service)
 
 
+def _ensure_trusted_phone(service) -> None:
+    """Populate `service._auth_data` with the account's trusted phone number(s).
+
+    The 2FA challenge is bootstrapped from Apple's HTML auth shell (`Accept: text/html`),
+    which is oriented at the trusted-device bridge and frequently omits phone numbers.
+    Re-fetching the same auth endpoint with `Accept: application/json` returns Apple's
+    SMS-oriented shape (a `trustedPhoneNumbers` list / `phoneNumberVerification` block);
+    we merge those keys in so pyicloud's `_trusted_phone_number()` can find a number.
+    Best-effort: on any failure we leave auth data as-is and let the SMS request surface
+    a clear error.
+    """
+    # Already known? Nothing to do.
+    try:
+        finder = getattr(service, "_trusted_phone_number", None)
+        if callable(finder) and finder() is not None:
+            return
+    except Exception:
+        pass
+
+    endpoint = getattr(service, "_auth_endpoint", None)
+    get_headers = getattr(service, "_get_auth_headers", None)
+    session = getattr(service, "session", None)
+    auth_data = getattr(service, "_auth_data", None)
+    if not (endpoint and callable(get_headers) and session is not None and isinstance(auth_data, dict)):
+        return
+
+    try:
+        resp = session.get(endpoint, headers=get_headers({"Accept": "application/json"}))
+        data = resp.json() if hasattr(resp, "json") else None
+    except Exception:
+        logger.debug("Could not fetch SMS auth options", exc_info=True)
+        return
+    if not isinstance(data, dict):
+        return
+
+    # Collect phone info from the top level and from a nested phoneNumberVerification.
+    pv = auth_data.get("phoneNumberVerification")
+    pv = dict(pv) if isinstance(pv, dict) else {}
+    nested = data.get("phoneNumberVerification")
+    sources = [data] + ([nested] if isinstance(nested, dict) else [])
+    for src in sources:
+        for key in ("trustedPhoneNumber", "trustedPhoneNumbers"):
+            if src.get(key) is not None and pv.get(key) is None:
+                pv[key] = src[key]
+    if pv:
+        auth_data["phoneNumberVerification"] = pv
+    if data.get("trustedPhoneNumber") is not None and auth_data.get("trustedPhoneNumber") is None:
+        auth_data["trustedPhoneNumber"] = data["trustedPhoneNumber"]
+    if data.get("trustedPhoneNumbers") is not None and auth_data.get("trustedPhoneNumbers") is None:
+        auth_data["trustedPhoneNumbers"] = data["trustedPhoneNumbers"]
+
+
 def _masked_trusted_phone(service) -> Optional[str]:
     """Best-effort masked trusted-phone string pulled from the in-flight auth data."""
-    try:
-        raw = getattr(service, "_auth_data", {}) or {}
-        tp = raw.get("trustedPhoneNumber")
-        if isinstance(tp, dict):
+    def _mask(d) -> Optional[str]:
+        if isinstance(d, dict):
             for key in ("numberWithDialCode", "obfuscatedNumber", "number", "lastTwoDigits"):
-                val = tp.get(key)
+                val = d.get(key)
                 if val:
                     return str(val)
+        return None
+
+    try:
+        auth = getattr(service, "_auth_data", {}) or {}
+        candidates = [auth.get("trustedPhoneNumber")]
+        lst = auth.get("trustedPhoneNumbers")
+        if isinstance(lst, list) and lst:
+            candidates.append(lst[0])
+        pv = auth.get("phoneNumberVerification")
+        if isinstance(pv, dict):
+            candidates.append(pv.get("trustedPhoneNumber"))
+            plst = pv.get("trustedPhoneNumbers")
+            if isinstance(plst, list) and plst:
+                candidates.append(plst[0])
+        for c in candidates:
+            m = _mask(c)
+            if m:
+                return m
     except Exception:
         pass
     return None
