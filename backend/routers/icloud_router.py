@@ -139,6 +139,55 @@ def _start_auth_blocking(apple_id: str, password: str, cookie_dir: str) -> str:
         return "2fa_required"
 
 
+class RestartRequest(BaseModel):
+    apple_id: str
+    password: str
+    label: Optional[str] = None
+
+
+@router.post("/connections/{connection_id}/restart")
+async def restart_connection(
+    connection_id: str,
+    body: RestartRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-begin authentication for an existing connection that never finished 2FA (or
+    whose in-memory pending-auth hold was lost to a backend restart). Reuses the row,
+    re-stores the (possibly edited) Apple ID / password / label, sends a fresh 2FA code,
+    and repopulates the pending-auth hold so /verify can complete it — no need to delete
+    and re-create the connection."""
+    conn = await _get_connection(db, user, connection_id)
+
+    conn.apple_id = body.apple_id
+    conn.label = body.label
+    conn.encrypted_password = encrypt(body.password)
+    conn.status = "pending_2fa"
+    conn.encrypted_session = None
+    await db.commit()
+    await db.refresh(conn)
+
+    # Drop any stale pending hold / half-written cookie dir before restarting.
+    cookie_dir = _auth_cookie_dir(connection_id)
+    _PENDING_AUTH.pop(cookie_dir, None)
+    shutil.rmtree(cookie_dir, ignore_errors=True)
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, _start_auth_blocking, body.apple_id, body.password, cookie_dir
+        )
+    except ic.ICloudAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if result == "2fa_required":
+        return {**_conn_out(conn), "status": "2fa_required"}
+
+    # No 2FA needed (rare): the session in cookie_dir is already trusted.
+    await _persist_session(db, conn, cookie_dir)
+    return _conn_out(conn)
+
+
 class VerifyRequest(BaseModel):
     code: str
 

@@ -200,6 +200,8 @@ export const api = {
     listConnections: () => req<ICloudConnection[]>('GET', '/icloud/connections'),
     createConnection: (data: { apple_id: string; password: string; label?: string }) =>
       req<ICloudConnection>('POST', '/icloud/connections', data),
+    restartConnection: (id: string, data: { apple_id: string; password: string; label?: string }) =>
+      req<ICloudConnection>('POST', `/icloud/connections/${id}/restart`, data),
     verifyConnection: (id: string, code: string) =>
       req<ICloudConnection>('POST', `/icloud/connections/${id}/verify`, { code }),
     sendSmsCode: (id: string) =>

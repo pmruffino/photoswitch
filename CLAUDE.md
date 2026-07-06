@@ -192,7 +192,12 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
     /connections/{id}/send-sms` asks Apple to text it to the account's trusted phone
     number instead (`icloud_client.request_sms_code` → pyicloud `_request_sms_2fa_code`,
     which flips delivery state to `sms` so the same `/verify` → `validate_2fa_code`
-    routes the texted code to the SMS verifier). The resulting **trusted
+    routes the texted code to the SMS verifier). If a connect is interrupted before
+    2FA finishes (or the single-instance backend restarts and loses the in-memory
+    `_PENDING_AUTH` hold), the connection is left at `status=pending_2fa`; `POST
+    /connections/{id}/restart` re-begins auth on that same row (re-storing the possibly
+    edited Apple ID / password / label and sending a fresh code) so the user can resume
+    without deleting and re-creating it. The resulting **trusted
     session** (a packed pyicloud cookie directory) and the Apple password are stored
     encrypted at rest on the `icloud_connections` row, reusing the same Fernet key as
     Immich credentials, so subsequent pulls skip 2FA. Apple expires trust ~every 2

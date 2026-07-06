@@ -41,6 +41,9 @@ interface Props {
 export default function ICloudSection({ destinations, onJobCreated }: Props) {
   const [conns, setConns] = useState<ICloudConnection[]>([])
   const [showConnect, setShowConnect] = useState(false)
+  // When set, the connect form is resuming an existing (stuck-at-2FA) connection
+  // rather than creating a new one.
+  const [resumeId, setResumeId] = useState<string | null>(null)
 
   // Connect form
   const [appleId, setAppleId] = useState('')
@@ -94,20 +97,37 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
     }
   }
 
+  // Open a blank connect form for a new account.
+  function openConnect() {
+    setResumeId(null); setAppleId(''); setLabel(''); setPassword('')
+    setConnectError(''); setShowConnect(true)
+  }
+  // Open the connect form pre-filled to resume an interrupted (Awaiting 2FA) connection.
+  function startResume(c: ICloudConnection) {
+    setResumeId(c.id); setAppleId(c.apple_id); setLabel(c.label ?? ''); setPassword('')
+    setConnectError(''); setPendingId(null); setSmsNotice(''); setShowConnect(true)
+  }
+  function closeConnect() {
+    setShowConnect(false); setResumeId(null); setConnectError('')
+  }
+
   async function connect(e: FormEvent) {
     e.preventDefault()
     setConnectError('')
     setConnectLoading(true)
     try {
-      const c = await api.icloud.createConnection({ apple_id: appleId, password, label: label || undefined })
+      const payload = { apple_id: appleId, password, label: label || undefined }
+      const c = resumeId
+        ? await api.icloud.restartConnection(resumeId, payload)
+        : await api.icloud.createConnection(payload)
       setConns(prev => [c, ...prev.filter(p => p.id !== c.id)])
       setPassword('')
       if (c.status === '2fa_required' || c.status === 'pending_2fa') {
         setPendingId(c.id)
-        setShowConnect(false)
+        setShowConnect(false); setResumeId(null)
       } else {
         // Rare: no 2FA needed.
-        setShowConnect(false)
+        setShowConnect(false); setResumeId(null)
         setAppleId(''); setLabel('')
       }
     } catch (err) {
@@ -166,7 +186,7 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
           </p>
         </div>
         <button
-          onClick={() => { setShowConnect(v => !v); setConnectError('') }}
+          onClick={() => showConnect ? closeConnect() : openConnect()}
           disabled={destinations.length === 0}
           className={BTN_PRIMARY + ' disabled:opacity-40 disabled:cursor-not-allowed'}
           title={destinations.length === 0 ? 'Add an Immich or WebDAV destination first' : undefined}
@@ -177,6 +197,11 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
 
       {showConnect && (
         <form onSubmit={connect} className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg p-5 mb-4 space-y-3">
+          {resumeId && (
+            <p className="text-sm font-medium text-slate-800 dark:text-zinc-100">
+              Resume connecting — re-enter your password to get a fresh verification code.
+            </p>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-slate-700 dark:text-zinc-300 mb-1">Apple ID</label>
@@ -267,6 +292,12 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
                         {panel?.id === c.id && panel.kind === 'sync' ? 'Close' : 'Configure sync'}
                       </button>
                     </>
+                  )}
+                  {(c.status === 'pending_2fa' || c.status === '2fa_required') && pendingId !== c.id && (
+                    <button onClick={() => startResume(c)}
+                      className="text-xs text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 font-medium">
+                      Resume connecting
+                    </button>
                   )}
                   {c.status === 'needs_reauth' && (
                     <span className="text-xs text-slate-500 dark:text-zinc-400">Delete &amp; reconnect to refresh the session</span>
