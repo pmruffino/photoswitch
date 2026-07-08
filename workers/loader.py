@@ -76,7 +76,13 @@ class LoaderWorker(BaseWorker):
         base_url, username, password, base_path = await self._get_webdav_creds(job.target.credential_ref)
         date_filter: Optional[DateFilter] = job.date_filter
         last_save = time.monotonic()
-        failures: list[str] = []
+        # "missing" = the asset never landed on the server at all. "partial" = it
+        # uploaded fine to its primary album/folder but a COPY into another album it
+        # also belongs to failed — the asset exists, but won't appear when browsing
+        # that other album, which looks exactly like "photo is missing" to a user who
+        # only checks that album.
+        missing: list[str] = []
+        partial: list[str] = []
 
         async with WebDavClient(base_url, username, password, base_path) as client:
             for asset in assets:
@@ -85,12 +91,14 @@ class LoaderWorker(BaseWorker):
                 else:
                     name = os.path.basename(asset.file_path)
                     try:
-                        ok = await client.upload_asset(asset)
+                        notes = await client.upload_asset(asset)
                     except Exception as exc:
-                        ok = False
+                        notes = [f"{name}: upload failed ({exc})"]
                         logger.warning("WebDAV upload failed for %s: %s", asset.file_path, exc)
-                    if not ok:
-                        failures.append(name)
+                    if any("upload failed" in n or "video upload failed" in n for n in notes):
+                        missing.append(name)
+                    elif notes:
+                        partial.extend(notes)
                     job.processed_items += 1
 
                 now = time.monotonic()
@@ -98,14 +106,19 @@ class LoaderWorker(BaseWorker):
                     await self.save_job(job)
                     last_save = now
 
-        # Surface uploads the server rejected instead of silently dropping them.
-        if failures:
-            preview = ", ".join(failures[:5])
-            more = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
-            note = (
-                f"{len(failures)} of {len(assets)} file(s) failed to upload to the WebDAV "
-                f"destination: {preview}{more}"
-            )
+        # Surface uploads the server rejected, and album-membership gaps, instead of
+        # silently dropping them.
+        parts = []
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+            parts.append(f"{len(missing)} of {len(assets)} file(s) failed to upload: {preview}{more}")
+        if partial:
+            preview = "; ".join(partial[:5])
+            more = f" (+{len(partial) - 5} more)" if len(partial) > 5 else ""
+            parts.append(f"{len(partial)} album-membership issue(s) (file uploaded, but missing from an extra album): {preview}{more}")
+        if parts:
+            note = " | ".join(parts)
             job.warnings = f"{job.warnings} | {note}" if job.warnings else note
             logger.warning("Job %s: %s", job.id, note)
 

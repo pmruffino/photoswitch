@@ -25,7 +25,7 @@ function MoonIcon() {
 }
 
 export default function Login() {
-  const { user, loading } = useAuth()
+  const { user, loading, sessionExpired, dismissSessionExpired } = useAuth()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [rememberMe, setRememberMe] = useState(false)
@@ -51,6 +51,7 @@ export default function Login() {
     try {
       const user = await api.auth.login(username, password, rememberMe)
       setUser(user)
+      dismissSessionExpired()
       navigate(from, { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed')
@@ -73,6 +74,12 @@ export default function Login() {
       <div className="w-full max-w-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg p-8 shadow-sm">
         <h1 className="text-2xl font-semibold text-slate-900 dark:text-zinc-100 mb-1">Sign in</h1>
         <p className="text-sm text-slate-500 dark:text-zinc-400 mb-6">Photoswitch</p>
+
+        {sessionExpired && (
+          <p className="mb-4 text-sm bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800 rounded-md px-3 py-2">
+            Your session expired. Please sign in again.
+          </p>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>

@@ -140,13 +140,18 @@ class WebDavClient:
 
     # -- High-level asset operations -----------------------------------------
 
-    async def upload_asset(self, asset: MappedAsset) -> bool:
+    async def upload_asset(self, asset: MappedAsset) -> list[str]:
         """Upload one asset once, then place it in any additional albums via COPY.
 
-        Returns True if the primary photo's bytes are present on the server afterward
-        (uploaded now or already there), False if the PUT failed — so the Loader can
-        count and surface real misses rather than swallowing them.
+        Returns a list of human-readable failure notes — empty means fully successful.
+        A failed primary PUT means the asset is entirely missing from the destination
+        (nothing else is attempted). A failed extra-album COPY means the asset DID
+        upload and is visible in its primary album/folder, but won't appear when
+        browsing any other album it also belongs to — previously this was only logged
+        to the worker's own log, never surfaced to the job, so it looked exactly like
+        "photo silently missing" to anyone checking a non-primary album.
         """
+        failures: list[str] = []
         albums = list(asset.albums or [])
         primary_album = albums[0] if albums else None
         primary_dir = self._album_dir(primary_album)
@@ -154,9 +159,10 @@ class WebDavClient:
 
         photo = os.path.basename(asset.file_path)
         primary_photo = primary_dir + [photo]
-        ok = True
         if not await self.exists(primary_photo):
-            ok = await self.put_with_retry(asset.file_path, primary_photo)
+            if not await self.put_with_retry(asset.file_path, primary_photo):
+                failures.append(f"{photo}: upload failed")
+                return failures  # nothing else can succeed without the primary bytes
 
         has_video = bool(asset.is_live_photo and asset.live_video_path and os.path.exists(asset.live_video_path))
         primary_video = None
@@ -165,7 +171,7 @@ class WebDavClient:
             primary_video = primary_dir + [video]
             if not await self.exists(primary_video):
                 if not await self.put_with_retry(asset.live_video_path, primary_video):
-                    logger.warning("WebDAV: live-photo video PUT failed for %s", photo)
+                    failures.append(f"{video}: live-photo video upload failed")
 
         # Extra albums: server-side COPY only — never re-upload the bytes.
         for album in albums[1:]:
@@ -174,14 +180,14 @@ class WebDavClient:
             dest_photo = extra_dir + [photo]
             if not await self.exists(dest_photo):
                 if not await self.copy(primary_photo, dest_photo):
-                    logger.warning(
-                        "WebDAV COPY not supported for %s → album %s; skipping extra album membership",
-                        photo, album,
-                    )
+                    failures.append(f"{photo}: not added to album '{album}' (server COPY unsupported/failed)")
             if has_video:
                 dest_video = extra_dir + [os.path.basename(asset.live_video_path)]
                 if not await self.exists(dest_video):
-                    await self.copy(primary_video, dest_video)
+                    if not await self.copy(primary_video, dest_video):
+                        failures.append(f"{os.path.basename(asset.live_video_path)}: not added to album '{album}'")
+
+        return failures
 
         return ok
 

@@ -96,6 +96,20 @@ export interface Config {
   cleanup_hour: number
 }
 
+// Fires when ANY API call comes back 401 — i.e. the browser's session cookie has
+// expired or was rejected. Without this, a session that expires while a tab is left
+// open just fails silently and confusingly on whatever the user clicks next (it looks
+// like an error in that specific feature, not an expired login). AuthProvider
+// registers a handler that clears the user and shows a "please sign in again" prompt.
+let onSessionExpired: (() => void) | null = null
+export function setSessionExpiredHandler(fn: (() => void) | null) {
+  onSessionExpired = fn
+}
+// The initial "am I logged in" probe and the login form itself expect a bare 401
+// (not-logged-in / bad-credentials) as normal, unremarkable outcomes — they must not
+// trigger the global expiry prompt.
+const SESSION_CHECK_EXEMPT_PATHS = new Set(['/auth/me', '/auth/login'])
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method,
@@ -105,7 +119,12 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   })
   if (res.status === 204) return undefined as unknown as T
   const data = await res.json().catch(() => ({ detail: res.statusText }))
-  if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`)
+  if (!res.ok) {
+    if (res.status === 401 && !SESSION_CHECK_EXEMPT_PATHS.has(path)) {
+      onSessionExpired?.()
+    }
+    throw new Error(data.detail ?? `HTTP ${res.status}`)
+  }
   return data as T
 }
 

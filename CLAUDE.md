@@ -202,8 +202,10 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
     `_PENDING_AUTH` hold), the connection is left at `status=pending_2fa`; `POST
     /connections/{id}/restart` re-begins auth on that same row (re-storing the possibly
     edited Apple ID / password / label and sending a fresh code) so the user can resume
-    without deleting and re-creating it. The resulting **trusted
-    session** (a packed pyicloud cookie directory) and the Apple password are stored
+    without deleting and re-creating it. The same restart flow (UI label "Reconnect")
+    also covers `status=needs_reauth` (Apple's ~2-month trust expiry) — there is no
+    dead end that forces delete-and-recreate for any iCloud auth state. The resulting
+    **trusted session** (a packed pyicloud cookie directory) and the Apple password are stored
     encrypted at rest on the `icloud_connections` row, reusing the same Fernet key as
     Immich credentials, so subsequent pulls skip 2FA. Apple expires trust ~every 2
     months; the connection is then flagged `needs_reauth`. Metadata comes from the
@@ -248,7 +250,17 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
 - **Run model:** manual trigger. Designed so an external scheduler can kick jobs.
 - **Multi-tenant:** jobs are keyed by user. Per-user worker scoping is supported.
 - **Auth:** local accounts only. Argon2 password hashing. Sessions in Redis.
-  New-user policy: `open` / `approval` / `closed` (admin-configurable).
+  New-user policy: `open` / `approval` / `closed` (admin-configurable). Session cookie
+  + Redis TTL are the same value (`SESSION_TTL_SECONDS`, default 24h, or 30 days with
+  "remember me") so they expire together. **Session-expiry UX:** `AuthProvider` only
+  checks `/auth/me` once at mount, so a session that expires while a tab stays open
+  would otherwise fail silently and confusingly on whatever the user next clicks
+  (surfacing the backend's generic `401 "Not authenticated"`, misread as a feature-
+  specific error e.g. on an iCloud button). `frontend/src/api.ts`'s `req()` calls a
+  registered `onSessionExpired` handler on any 401 (except `/auth/me` and
+  `/auth/login`, which normally 401 for a logged-out visitor / bad password);
+  `AuthProvider` clears `user` and sets `sessionExpired`, which routes to `/login` and
+  shows "Your session expired. Please sign in again."
 - **Bootstrap:** the FIRST successful registration becomes admin, guarded by an
   "is the users table empty?" check. Cannot be hijacked afterward.
 - **Roles:** `admin` and `user`.
@@ -367,7 +379,15 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   "already uploaded" and skip the PUT). Both stages summarise skipped/failed items into
   the job's non-fatal `warnings` field (`schemas.Job.warnings`), surfaced amber in the
   Imports table so partial data-loss is visible instead of silent. `warnings` lives in
-  Redis live state only (not the durable `job_records` row).
+  Redis live state only (not the durable `job_records` row). Two more silent-drop paths
+  were closed the same way: the Mapper's iCloud-manifest path now reports (instead of
+  only logging) any downloaded file that went missing from staging before mapping; and
+  `WebDavClient.upload_asset` now returns per-asset failure notes distinguishing a
+  **missing** asset (the primary PUT never landed — the file is absent entirely) from a
+  **partial** one (the primary PUT succeeded but a COPY into an additional album
+  failed) — the latter previously only hit the worker's log, so a photo could be fully
+  uploaded yet silently absent from every album folder except its first, with zero
+  visible warning.
 - **Live job state:** canonical job state lives in Redis (`psw:job:{id}`). Postgres
   `job_records` is updated at stage transitions for durable history. The dashboard
   reads from Redis for live progress.

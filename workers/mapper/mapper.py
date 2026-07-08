@@ -142,6 +142,7 @@ class MapperWorker(BaseWorker):
             entries = json.load(f)
 
         mapped: list[MappedAsset] = []
+        missing: list[str] = []
         job.total_items = len(entries)
         job.processed_items = 0
         last_save = time.monotonic()
@@ -150,6 +151,7 @@ class MapperWorker(BaseWorker):
             media_path = entry["file_path"]
             if not os.path.exists(media_path):
                 logger.warning("Manifest file missing on disk: %s", media_path)
+                missing.append(entry.get("filename") or os.path.basename(media_path))
                 job.processed_items += 1
                 continue
 
@@ -189,6 +191,16 @@ class MapperWorker(BaseWorker):
         output_path = os.path.join(job.staging_dir, "mapped_assets.json")
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump([a.model_dump(mode="json") for a in mapped], f)
+
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+            note = (
+                f"{len(missing)} of {len(entries)} downloaded file(s) went missing before "
+                f"mapping and were skipped: {preview}{more}"
+            )
+            job.warnings = f"{job.warnings} | {note}" if job.warnings else note
+            logger.warning("Job %s: %s", job.id, note)
 
         logger.info("Job %s mapped %d iCloud assets, wrote %s", job.id, len(mapped), output_path)
 

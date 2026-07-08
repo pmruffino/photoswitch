@@ -293,14 +293,11 @@ export default function ICloudSection({ destinations, onJobCreated }: Props) {
                       </button>
                     </>
                   )}
-                  {(c.status === 'pending_2fa' || c.status === '2fa_required') && pendingId !== c.id && (
+                  {(c.status === 'pending_2fa' || c.status === '2fa_required' || c.status === 'needs_reauth') && pendingId !== c.id && (
                     <button onClick={() => startResume(c)}
                       className="text-xs text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 font-medium">
-                      Resume connecting
+                      {c.status === 'needs_reauth' ? 'Reconnect' : 'Resume connecting'}
                     </button>
-                  )}
-                  {c.status === 'needs_reauth' && (
-                    <span className="text-xs text-slate-500 dark:text-zinc-400">Delete &amp; reconnect to refresh the session</span>
                   )}
                   <button onClick={() => removeConn(c.id)} className="text-xs text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300">
                     Remove
