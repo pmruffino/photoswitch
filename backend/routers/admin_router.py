@@ -212,6 +212,7 @@ def _job_out(record: JobRecord, live: dict | None, username: str) -> dict:
         "total_items": record.total_items,
         "processed_items": record.processed_items,
         "error": record.error,
+        "warnings": None,
         "created_at": record.created_at.isoformat(),
         "updated_at": record.updated_at.isoformat(),
         "date_filter": None,
@@ -226,6 +227,7 @@ def _job_out(record: JobRecord, live: dict | None, username: str) -> dict:
             out["total_items"] = live["total_items"]
         out["processed_items"] = live.get("processed_items", out["processed_items"])
         out["error"] = live.get("error") or out["error"]
+        out["warnings"] = live.get("warnings")
         out["date_filter"] = live.get("date_filter")
         out["auto_ingest"] = live.get("auto_ingest", True)
         out["source"] = live.get("source", out["source"])

@@ -31,6 +31,7 @@ import io
 import logging
 import os
 import tarfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, Optional
@@ -304,29 +305,51 @@ class PullResult:
     # Max asset timestamp (ms since epoch) seen this run — the next sync's watermark.
     new_watermark_ms: Optional[int]
     total_seen: int
+    # Assets that could not be downloaded after retries — "<filename>: <reason>". Kept so
+    # the Fetcher can surface partial loss instead of silently dropping them.
+    failures: list[str] = field(default_factory=list)
 
 
-def _asset_ms(photo) -> Optional[int]:
-    """Milliseconds-since-epoch for a PhotoAsset.
-
-    pyicloud 2.6.5 exposes `asset_date` and `created` as datetimes; older forks used
-    a millisecond int. Handle both.
-    """
-    for attr in ("asset_date", "created"):
-        val = getattr(photo, attr, None)
-        if isinstance(val, datetime):
-            return int(val.timestamp() * 1000)
-        if isinstance(val, (int, float)):
-            return int(val)
+def _ms_from(val) -> Optional[int]:
+    """Coerce a pyicloud date attribute (datetime | ms-int | None) to ms-since-epoch."""
+    if isinstance(val, datetime):
+        return int(val.timestamp() * 1000)
+    if isinstance(val, (int, float)):
+        return int(val)
     return None
 
 
-def _iter_photos_newest_first(api) -> Iterator[object]:
-    """Yield PhotoAssets newest-first so a watermark scan can stop early.
+def _asset_ms(photo) -> Optional[int]:
+    """Capture ("taken") time in ms. Used only for EXIF `taken_at`, NOT the watermark."""
+    for attr in ("asset_date", "created"):
+        ms = _ms_from(getattr(photo, attr, None))
+        if ms is not None:
+            return ms
+    return None
 
-    pyicloud's `all` album iterates oldest-first. Version 2.6.5 has a private
-    `_iter_added_desc_photos` (added-descending) we prefer for efficiency; otherwise
-    we buffer and reverse (correct, but reads all metadata on a first full sync).
+
+def _added_ms(photo) -> Optional[int]:
+    """Time the asset was ADDED to the iCloud library, in ms — the incremental watermark
+    key. This MUST match the iteration order (`_iter_added_desc_photos` walks the added
+    index newest-first). Using capture time here instead would break the early-stop:
+    an old photo added recently (screenshot, received image, import) sorts near the top
+    but has an old capture time, prematurely ending the scan and skipping everything
+    below it. pyicloud returns the Unix epoch (0) for a missing addedDate — treat that
+    as unknown (None) so a stray record can't trigger the early break.
+    """
+    ms = _ms_from(getattr(photo, "added_date", None))
+    if ms is None or ms <= 0:
+        return None
+    return ms
+
+
+def _iter_photos_newest_first(api) -> Iterator[object]:
+    """Yield PhotoAssets by ADDED date, newest-first, so the watermark scan can stop
+    early at the first already-synced asset.
+
+    Version 2.6.5 has `_iter_added_desc_photos` (walks Apple's added index descending)
+    which we prefer. The fallback buffers and sorts by added-date descending so the
+    order still matches the watermark comparison in `pull_new_photos`.
     """
     album = api.photos.all
     desc = getattr(album, "_iter_added_desc_photos", None)
@@ -335,8 +358,8 @@ def _iter_photos_newest_first(api) -> Iterator[object]:
             yield from desc()
             return
         except Exception:
-            logger.warning("added-descending iteration failed; falling back to reverse buffer")
-    yield from reversed(list(album))
+            logger.warning("added-descending iteration failed; falling back to sorted buffer")
+    yield from sorted(list(album), key=lambda p: (_added_ms(p) or 0), reverse=True)
 
 
 def pull_new_photos(
@@ -346,43 +369,103 @@ def pull_new_photos(
     max_items: Optional[int] = None,
     progress_cb=None,
 ) -> PullResult:
-    """Download originals newer than `since_ms` into `dest_dir`.
+    """Download originals ADDED to iCloud after `since_ms` into `dest_dir`.
 
-    Iterates newest-first and stops at the first asset at/older than the watermark
-    (icloudpd's --until-found idea). Live Photos download the still + its paired
-    video as separate files. Immich checksum-dedup on the Loader is the backstop if
-    the watermark ever lets a duplicate through.
+    `since_ms` and the returned watermark are keyed on each asset's *added-to-library*
+    time (not capture time), matching the added-date iteration order so the early stop
+    is valid. Iterates newest-added-first and stops at the first asset at/older than the
+    watermark (icloudpd's --until-found idea). Live Photos download the still + its
+    paired video as separate files. Immich checksum-dedup (and WebDAV path-dedup) on the
+    Loader is the backstop if the watermark ever lets a duplicate through.
     """
     os.makedirs(dest_dir, exist_ok=True)
     assets: list[PulledAsset] = []
-    new_watermark = since_ms
+    failures: list[str] = []
     seen = 0
+    success_max_ms: Optional[int] = None
+    failed_min_ms: Optional[int] = None
 
     for photo in _iter_photos_newest_first(api):
-        ms = _asset_ms(photo)
+        ms = _added_ms(photo)
         if since_ms is not None and ms is not None and ms <= since_ms:
-            # Newest-first: everything past here is already synced.
+            # Newest-added-first: everything past here was added on/before the last sync.
             break
 
         seen += 1
-        if new_watermark is None or (ms is not None and ms > new_watermark):
-            new_watermark = ms
-
-        try:
-            pulled = _download_asset(photo, dest_dir)
-        except Exception as exc:
-            logger.warning("Failed to download iCloud asset %s: %s",
-                           getattr(photo, "id", "?"), exc)
-            continue
-        if pulled:
+        pulled, reason = _download_with_retry(photo, dest_dir)
+        if pulled is not None:
             assets.append(pulled)
+            if ms is not None and (success_max_ms is None or ms > success_max_ms):
+                success_max_ms = ms
+            if progress_cb:
+                progress_cb(len(assets))
+        else:
+            fname = _safe_name(getattr(photo, "filename", None) or str(getattr(photo, "id", "asset")))
+            failures.append(f"{fname}: {reason}")
+            logger.warning("Skipped iCloud asset %s: %s", fname, reason)
+            # Keep the watermark below the oldest failure so it is retried next run
+            # rather than being permanently skipped.
+            if ms is not None and (failed_min_ms is None or ms < failed_min_ms):
+                failed_min_ms = ms
 
-        if progress_cb:
-            progress_cb(len(assets))
         if max_items is not None and len(assets) >= max_items:
             break
 
-    return PullResult(assets=assets, new_watermark_ms=new_watermark, total_seen=seen)
+    # Advance the watermark to the newest successfully-pulled asset, but never at/above a
+    # failed asset — so a transient failure is re-attempted on the next sync (WebDAV
+    # path-dedup / Immich checksum-dedup absorbs any re-pulled successes above it).
+    new_watermark = since_ms
+    if success_max_ms is not None:
+        new_watermark = success_max_ms if new_watermark is None else max(new_watermark, success_max_ms)
+    if failed_min_ms is not None:
+        clamp = failed_min_ms - 1
+        new_watermark = clamp if new_watermark is None else min(new_watermark, clamp)
+
+    return PullResult(
+        assets=assets, new_watermark_ms=new_watermark, total_seen=seen, failures=failures,
+    )
+
+
+def _download_with_retry(photo, dest_dir: str, attempts: int = 3):
+    """Download one asset with retries. Returns (PulledAsset | None, reason).
+
+    Transient errors (network resets, 5xx from the iCloud CDN) are retried with backoff.
+    A missing downloadable resource is not retried (it won't fix itself) — it's reported
+    as a reason so the Fetcher can surface it instead of silently dropping the asset.
+    """
+    last_reason = "unknown error"
+    for attempt in range(1, attempts + 1):
+        try:
+            pulled = _download_asset(photo, dest_dir)
+            if pulled is not None:
+                return pulled, ""
+            return None, "no downloadable full-resolution resource (asset may not be fully stored in iCloud)"
+        except Exception as exc:
+            last_reason = f"{type(exc).__name__}: {exc}"
+            if attempt < attempts:
+                time.sleep(min(2 ** attempt, 8))
+    return None, last_reason
+
+
+def _download_original_bytes(photo, dest_path: str) -> bool:
+    """Write the asset's full-resolution bytes to `dest_path`.
+
+    Prefers the true `original`; if that resource is absent, falls back to Apple's
+    full-res `alternative` (e.g. the JPEG paired with a RAW, or a full-size edited
+    version). We deliberately do NOT fall back to downscaled versions — a genuine miss
+    is reported instead so the library's fidelity is honest. A transient error on the
+    primary version propagates so the retry logic can see it.
+    """
+    if _write_download(photo.download("original"), dest_path):
+        return True
+    try:
+        if _write_download(photo.download("alternative"), dest_path):
+            logger.info("Asset %s had no 'original' resource; used 'alternative'",
+                        getattr(photo, "filename", "?"))
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _write_download(result, dest_path: str) -> bool:
@@ -408,12 +491,41 @@ def _write_download(result, dest_path: str) -> bool:
     return False
 
 
+def _asset_token(photo) -> str:
+    """Short, stable per-asset token for disambiguating a colliding filename.
+
+    Derived from the iCloud asset id so the SAME asset always yields the SAME token —
+    a re-pulled asset keeps its filename, so the downstream WebDAV upload stays
+    idempotent (same target path → skipped, never duplicated).
+    """
+    import hashlib
+    ident = str(getattr(photo, "id", None) or getattr(photo, "filename", "") or id(photo))
+    return hashlib.sha1(ident.encode("utf-8", "ignore")).hexdigest()[:8]
+
+
+def _unique_name(name: str, photo, dest_dir: str) -> str:
+    """Avoid clobbering a *different* asset that already claimed this filename this pull.
+
+    Two iCloud photos can share a filename (e.g. `IMG_0001.HEIC` from different devices
+    or received images). Writing both to `dest_dir/name` would overwrite the first, and
+    on a WebDAV destination (no checksum dedup) the second would then collide on the
+    same remote path. If the name is already taken, insert a stable per-asset token.
+    """
+    if not os.path.exists(os.path.join(dest_dir, name)):
+        return name
+    stem, ext = os.path.splitext(name)
+    return f"{stem}~{_asset_token(photo)}{ext}"
+
+
 def _download_asset(photo, dest_dir: str) -> Optional[PulledAsset]:
     """Download the original of one PhotoAsset (+ Live Photo video) to `dest_dir`."""
-    filename = _safe_name(getattr(photo, "filename", None) or f"{getattr(photo, 'id', 'asset')}.bin")
+    filename = _unique_name(
+        _safe_name(getattr(photo, "filename", None) or f"{getattr(photo, 'id', 'asset')}.bin"),
+        photo, dest_dir,
+    )
     dest_path = os.path.join(dest_dir, filename)
 
-    if not _write_download(photo.download("original"), dest_path):
+    if not _download_original_bytes(photo, dest_path):
         return None
 
     ms = _asset_ms(photo)

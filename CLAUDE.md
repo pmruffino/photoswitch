@@ -230,6 +230,15 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   record survives the retention window. Export-bundle imports are one-shot and cannot
   be scheduled. The sync watermark lives on the connection row, so per-run staging
   cleanup never breaks an in-progress sync.
+- **Incremental watermark is keyed on ADDED date, not capture date:** the Fetcher
+  iterates iCloud's added-date index newest-first (`_iter_added_desc_photos`) and stops
+  at the first asset added on/before `watermark_ms`; the watermark advances to the max
+  *added-to-library* time seen. This MUST match the iteration key — using capture time
+  would let an old photo added recently (a screenshot, a received/imported image) sort
+  near the top with an old capture date and prematurely end the scan, skipping every
+  newer-added photo below it. `_added_ms` (added time) drives the cutoff/watermark;
+  `_asset_ms` (capture time) is used only for the EXIF `taken_at`. A missing/zero
+  addedDate is treated as unknown so a stray record can't trigger the early break.
 - **Sync teardown:** deleting a sync-anchor job (`DELETE /api/jobs/{id}`) cleanly
   removes the schedule — it disables `sync_enabled`, clears `anchor_job_id`, and drops
   the per-connection Redis lock on the owning `icloud_connections` row. Deleting the
@@ -283,7 +292,15 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
       setups), the extra album membership is skipped with a warning rather than
       re-uploading. Re-runs are idempotent: existing target paths are skipped.
     - **No checksum dedup** (WebDAV has none); dedup is by target path/name plus the
-      source-side watermark. **Rollback** deletes the uploaded files by path.
+      source-side watermark. **Rollback** deletes the uploaded files by path. Because
+      dedup is by name, two *different* source photos that share a filename must not
+      collide on one folder: the iCloud Fetcher gives each pulled file a collision-safe,
+      per-asset-stable name (`icloud_client._unique_name` inserts a short token derived
+      from the asset id when a name is already taken in the staging dir) so neither the
+      staging write nor the WebDAV `PUT` overwrites/skips a distinct photo. (Known
+      residual edge: two same-named distinct photos added in *different* sync windows can
+      still land on the same clean remote name; if it bites, switch to always-unique
+      names.)
 - **Immich connection:** user pastes their Immich server URL + API key generated in
   their own Immich account (Account Settings → API Keys). Stored encrypted in
   Postgres. All httpx calls to Immich use `verify=False, follow_redirects=True` so
@@ -340,6 +357,17 @@ Workers share a `x-worker-base` YAML anchor for DRY config.
   statements right after `create_all`; each is safe to run every startup and no-ops once
   applied. New non-nullable columns on existing tables must be added here (with a
   `DEFAULT`), not just on the model.
+- **Partial-failure visibility (no silent drops):** stages that process many files
+  never swallow per-item failures. The iCloud Fetcher retries transient downloads (with
+  backoff) and falls back from `original` to Apple's full-res `alternative`; anything
+  still undownloadable is collected in `PullResult.failures` and the watermark is held
+  *below* the oldest failure so it retries next sync (rather than being skipped forever).
+  The WebDAV client retries PUTs, checks their result, and `exists()` no longer follows
+  redirects (an auth/misconfig redirect to a 200 login page must not masquerade as
+  "already uploaded" and skip the PUT). Both stages summarise skipped/failed items into
+  the job's non-fatal `warnings` field (`schemas.Job.warnings`), surfaced amber in the
+  Imports table so partial data-loss is visible instead of silent. `warnings` lives in
+  Redis live state only (not the durable `job_records` row).
 - **Live job state:** canonical job state lives in Redis (`psw:job:{id}`). Postgres
   `job_records` is updated at stage transitions for durable history. The dashboard
   reads from Redis for live progress.

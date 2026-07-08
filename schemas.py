@@ -329,6 +329,10 @@ class Job(BaseModel):
     total_items: Optional[int] = None
     processed_items: int = 0
     error: Optional[str] = None
+    # Non-fatal summary of items that were skipped/failed within a succeeded stage
+    # (e.g. photos that would not download, or WebDAV PUTs the server rejected). Set so
+    # partial data-loss is visible in the UI instead of being silently swallowed.
+    warnings: Optional[str] = None
     attempts: int = 0
 
     created_at: datetime = Field(default_factory=_now)

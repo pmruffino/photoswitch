@@ -111,8 +111,22 @@ class FetcherWorker(BaseWorker):
         job.extracted_dir = extracted_dir
         job.total_items = len(result.assets)
         job.processed_items = len(result.assets)
-        logger.info("Job %s pulled %d new iCloud assets (scanned %d)",
-                    job.id, len(result.assets), result.total_seen)
+
+        # Surface any assets that could not be downloaded (after retries) instead of
+        # silently dropping them. The watermark was already held below the oldest
+        # failure, so they'll be retried on the next sync.
+        if result.failures:
+            preview = "; ".join(result.failures[:5])
+            more = f" (+{len(result.failures) - 5} more)" if len(result.failures) > 5 else ""
+            job.warnings = (
+                f"{len(result.failures)} of {result.total_seen} asset(s) could not be "
+                f"downloaded from iCloud and will be retried next sync: {preview}{more}"
+            )
+            logger.warning("Job %s: %d iCloud asset(s) failed to download: %s%s",
+                           job.id, len(result.failures), preview, more)
+
+        logger.info("Job %s pulled %d new iCloud assets (scanned %d, %d failed)",
+                    job.id, len(result.assets), result.total_seen, len(result.failures))
 
     async def _mark_needs_reauth(self, connection_ref: str) -> None:
         if not self._db_pool:

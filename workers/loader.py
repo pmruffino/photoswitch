@@ -76,22 +76,38 @@ class LoaderWorker(BaseWorker):
         base_url, username, password, base_path = await self._get_webdav_creds(job.target.credential_ref)
         date_filter: Optional[DateFilter] = job.date_filter
         last_save = time.monotonic()
+        failures: list[str] = []
 
         async with WebDavClient(base_url, username, password, base_path) as client:
             for asset in assets:
                 if date_filter and not date_filter.includes(asset.taken_at):
                     job.processed_items += 1
                 else:
+                    name = os.path.basename(asset.file_path)
                     try:
-                        await client.upload_asset(asset)
+                        ok = await client.upload_asset(asset)
                     except Exception as exc:
+                        ok = False
                         logger.warning("WebDAV upload failed for %s: %s", asset.file_path, exc)
+                    if not ok:
+                        failures.append(name)
                     job.processed_items += 1
 
                 now = time.monotonic()
                 if now - last_save >= 5.0:
                     await self.save_job(job)
                     last_save = now
+
+        # Surface uploads the server rejected instead of silently dropping them.
+        if failures:
+            preview = ", ".join(failures[:5])
+            more = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
+            note = (
+                f"{len(failures)} of {len(assets)} file(s) failed to upload to the WebDAV "
+                f"destination: {preview}{more}"
+            )
+            job.warnings = f"{job.warnings} | {note}" if job.warnings else note
+            logger.warning("Job %s: %s", job.id, note)
 
     async def _load_immich(self, job: Job, assets: list[MappedAsset]) -> None:
         server_url, api_key = await self._get_api_key(job.target.credential_ref)

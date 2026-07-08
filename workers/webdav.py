@@ -19,6 +19,7 @@ All requests use verify=False, follow_redirects=True — the same convention as 
 Immich calls, so self-signed / proxied certs work without configuration.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -88,8 +89,24 @@ class WebDavClient:
             self._ensured.add(key)
 
     async def exists(self, segments: list[str]) -> bool:
-        resp = await self._client.request("HEAD", self._url(segments))
-        return resp.status_code < 400
+        # Do NOT follow redirects here: an auth/misconfig redirect to a login page
+        # (302 → 200) would otherwise look like "file present" and cause us to skip the
+        # PUT — silently missing the upload. Only an explicit 200/204/207 counts.
+        resp = await self._client.request("HEAD", self._url(segments), follow_redirects=False)
+        return resp.status_code in (200, 204, 207)
+
+    async def put_with_retry(self, local_path: str, segments: list[str], attempts: int = 3) -> bool:
+        """PUT with retries for transient failures (network resets, 5xx, timeouts)."""
+        for attempt in range(1, attempts + 1):
+            try:
+                if await self.put_file(local_path, segments):
+                    return True
+            except Exception as exc:
+                logger.warning("WebDAV PUT error %s (attempt %d/%d): %s",
+                               "/".join(segments), attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(min(2 ** attempt, 8))
+        return False
 
     async def put_file(self, local_path: str, segments: list[str]) -> bool:
         # Async generator so httpx streams the body (an async client rejects a sync
@@ -123,8 +140,13 @@ class WebDavClient:
 
     # -- High-level asset operations -----------------------------------------
 
-    async def upload_asset(self, asset: MappedAsset) -> None:
-        """Upload one asset once, then place it in any additional albums via COPY."""
+    async def upload_asset(self, asset: MappedAsset) -> bool:
+        """Upload one asset once, then place it in any additional albums via COPY.
+
+        Returns True if the primary photo's bytes are present on the server afterward
+        (uploaded now or already there), False if the PUT failed — so the Loader can
+        count and surface real misses rather than swallowing them.
+        """
         albums = list(asset.albums or [])
         primary_album = albums[0] if albums else None
         primary_dir = self._album_dir(primary_album)
@@ -132,8 +154,9 @@ class WebDavClient:
 
         photo = os.path.basename(asset.file_path)
         primary_photo = primary_dir + [photo]
+        ok = True
         if not await self.exists(primary_photo):
-            await self.put_file(asset.file_path, primary_photo)
+            ok = await self.put_with_retry(asset.file_path, primary_photo)
 
         has_video = bool(asset.is_live_photo and asset.live_video_path and os.path.exists(asset.live_video_path))
         primary_video = None
@@ -141,7 +164,8 @@ class WebDavClient:
             video = os.path.basename(asset.live_video_path)
             primary_video = primary_dir + [video]
             if not await self.exists(primary_video):
-                await self.put_file(asset.live_video_path, primary_video)
+                if not await self.put_with_retry(asset.live_video_path, primary_video):
+                    logger.warning("WebDAV: live-photo video PUT failed for %s", photo)
 
         # Extra albums: server-side COPY only — never re-upload the bytes.
         for album in albums[1:]:
@@ -158,6 +182,8 @@ class WebDavClient:
                 dest_video = extra_dir + [os.path.basename(asset.live_video_path)]
                 if not await self.exists(dest_video):
                     await self.copy(primary_video, dest_video)
+
+        return ok
 
     async def delete_asset(self, asset: MappedAsset) -> None:
         """Delete every file this asset produced — the photo (+ live video) in each

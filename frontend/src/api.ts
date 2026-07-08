@@ -73,6 +73,7 @@ export interface Job {
   processed_items: number
   total_items: number | null
   error: string | null
+  warnings?: string | null
   date_filter: DateFilter | null
   auto_ingest: boolean
   source?: 'google_takeout' | 'icloud_bundle' | 'icloud_direct'

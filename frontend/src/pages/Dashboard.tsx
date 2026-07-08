@@ -481,8 +481,12 @@ export default function Dashboard() {
                             : '—'}
                         </td>
                         <td className="px-4 py-3 text-slate-500 dark:text-zinc-400">{new Date(job.created_at).toLocaleString()}</td>
-                        <td className="px-4 py-3 text-red-600 dark:text-red-400 max-w-xs">
-                          <span className="break-words whitespace-normal line-clamp-4" title={job.error ?? undefined}>{job.error ?? '—'}</span>
+                        <td className="px-4 py-3 max-w-xs">
+                          {job.error
+                            ? <span className="text-red-600 dark:text-red-400 break-words whitespace-normal line-clamp-4" title={job.error}>{job.error}</span>
+                            : job.warnings
+                              ? <span className="text-amber-600 dark:text-amber-400 break-words whitespace-normal line-clamp-4" title={job.warnings}>⚠ {job.warnings}</span>
+                              : <span className="text-slate-400 dark:text-zinc-500">—</span>}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-3">
